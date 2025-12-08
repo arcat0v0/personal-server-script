@@ -9,6 +9,8 @@
 # - Import SSH keys from GitHub
 # - Update system
 # - Install and configure zsh with oh-my-zsh
+# - Install and configure starship prompt
+# - Install and configure direnv
 # - Install mosh for better remote connections
 # - Enable BBR if supported
 #############################################
@@ -239,11 +241,43 @@ install_zsh() {
     log_info "Configuring zsh plugins..."
     su - "$username" -c "sed -i 's/^plugins=(git)/plugins=(git sudo zsh-autosuggestions zsh-syntax-highlighting colored-man-pages command-not-found)/' ${user_home}/.zshrc"
 
+    # Install and configure starship
+    log_info "Installing starship prompt..."
+    curl -sS https://starship.rs/install.sh | sh -s -- -y
+
+    # Create config directory
+    su - "$username" -c "mkdir -p ${user_home}/.config"
+
+    # Apply plain-text-symbols preset
+    log_info "Configuring starship with plain-text-symbols preset..."
+    su - "$username" -c "starship preset plain-text-symbols -o ${user_home}/.config/starship.toml"
+
+    # Add starship initialization to .zshrc
+    log_info "Adding starship to .zshrc..."
+    su - "$username" -c "echo '' >> ${user_home}/.zshrc"
+    su - "$username" -c "echo '# Initialize starship prompt' >> ${user_home}/.zshrc"
+    su - "$username" -c "echo 'eval \"\$(starship init zsh)\"' >> ${user_home}/.zshrc"
+
     # Change default shell to zsh
     log_info "Setting zsh as default shell for $username..."
     chsh -s $(which zsh) "$username"
 
-    log_info "Zsh and oh-my-zsh installed successfully"
+    log_info "Zsh, oh-my-zsh, and starship installed successfully"
+}
+
+# Install direnv
+install_direnv() {
+    local username="arcat"
+    local user_home="/home/$username"
+
+    log_info "Installing direnv..."
+    apt-get install -y direnv
+
+    # Add direnv hook to .zshrc
+    log_info "Configuring direnv for zsh..."
+    su - "$username" -c "echo 'eval \"\$(direnv hook zsh)\"' >> ${user_home}/.zshrc"
+
+    log_info "Direnv installed successfully"
 }
 
 # Install mosh
@@ -334,6 +368,7 @@ main() {
     import_ssh_keys
     disable_root_login
     install_zsh
+    install_direnv
     install_mosh
     enable_bbr
     restart_ssh
@@ -346,6 +381,8 @@ main() {
     log_info "SSH keys imported from GitHub"
     log_info "Root login has been disabled"
     log_info "Zsh with oh-my-zsh has been installed"
+    log_info "Starship prompt has been configured with plain-text-symbols preset"
+    log_info "Direnv has been installed and configured"
     log_info "Mosh has been installed for better remote connections"
     log_info "BBR has been checked and enabled if supported"
     log_info ""
