@@ -61,13 +61,13 @@ parse_arguments() {
                 echo "Options:"
                 echo "  -a, --add-users         Enable adding additional users (will prompt for details)"
                 echo "  -u, --users USERS       Specify additional users (semicolon-separated)"
-                echo "                          Format: username:key_url[:sudo]"
+                echo "                          Format: username@key_url[:sudo]"
                 echo "  -h, --help              Show this help message"
                 echo ""
                 echo "Examples:"
                 echo "  $0                                    # Run with interactive prompts"
                 echo "  $0 -a                                 # Enable additional users, will prompt for details"
-                echo "  $0 -u 'alice:https://github.com/alice.keys:sudo;bob:https://github.com/bob.keys'"
+                echo "  $0 -u 'alice@https://github.com/alice.keys:sudo;bob@https://github.com/bob.keys'"
                 exit 0
                 ;;
             *)
@@ -127,11 +127,11 @@ prompt_additional_users() {
                 sudo_flag=":sudo"
             fi
 
-            # Add to user entries
+            # Add to user entries (format: username@key_url[:sudo])
             if [ -z "$user_entries" ]; then
-                user_entries="${username}:${key_url}${sudo_flag}"
+                user_entries="${username}@${key_url}${sudo_flag}"
             else
-                user_entries="${user_entries};${username}:${key_url}${sudo_flag}"
+                user_entries="${user_entries};${username}@${key_url}${sudo_flag}"
             fi
 
             log_info "Added user: $username"
@@ -319,16 +319,20 @@ create_additional_users() {
             continue
         fi
 
-        # Parse user entry: username:key_url[:sudo]
-        IFS=':' read -ra USER_PARTS <<< "$user_entry"
-        local username="${USER_PARTS[0]}"
-        local key_url="${USER_PARTS[1]}"
+        # Parse user entry: username@key_url[:sudo]
+        # Using @ to separate username from URL to avoid conflicts with URL colons
         local has_sudo=false
 
-        # Check if sudo flag is present
-        if [ "${#USER_PARTS[@]}" -ge 3 ] && [ "${USER_PARTS[2]}" = "sudo" ]; then
+        # Check if entry ends with :sudo
+        if [[ "$user_entry" == *:sudo ]]; then
             has_sudo=true
+            # Remove :sudo suffix
+            user_entry="${user_entry%:sudo}"
         fi
+
+        # Split by @ to get username and key_url
+        local username="${user_entry%%@*}"
+        local key_url="${user_entry#*@}"
 
         if [ -z "$username" ] || [ -z "$key_url" ]; then
             log_warn "Invalid user entry: $user_entry (skipping)"
