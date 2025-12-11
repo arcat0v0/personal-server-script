@@ -472,19 +472,31 @@ install_zsh() {
     log_info "Installing zsh..."
     apt-get install -y zsh git curl
 
-    log_info "Installing oh-my-zsh for $username..."
-
-    # Install oh-my-zsh as the user
-    su - "$username" -c 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended'
+    # Check if oh-my-zsh is already installed
+    if [ -d "${user_home}/.oh-my-zsh" ]; then
+        log_warn "oh-my-zsh is already installed for $username, skipping installation"
+    else
+        log_info "Installing oh-my-zsh for $username..."
+        # Install oh-my-zsh as the user
+        su - "$username" -c 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended'
+    fi
 
     # Install useful plugins
     log_info "Installing zsh plugins..."
 
     # zsh-autosuggestions
-    su - "$username" -c "git clone https://github.com/zsh-users/zsh-autosuggestions ${user_home}/.oh-my-zsh/custom/plugins/zsh-autosuggestions"
+    if [ -d "${user_home}/.oh-my-zsh/custom/plugins/zsh-autosuggestions" ]; then
+        log_warn "zsh-autosuggestions is already installed, skipping"
+    else
+        su - "$username" -c "git clone https://github.com/zsh-users/zsh-autosuggestions ${user_home}/.oh-my-zsh/custom/plugins/zsh-autosuggestions"
+    fi
 
     # zsh-syntax-highlighting
-    su - "$username" -c "git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${user_home}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting"
+    if [ -d "${user_home}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting" ]; then
+        log_warn "zsh-syntax-highlighting is already installed, skipping"
+    else
+        su - "$username" -c "git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${user_home}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting"
+    fi
 
     # Configure .zshrc with recommended plugins
     log_info "Configuring zsh plugins..."
