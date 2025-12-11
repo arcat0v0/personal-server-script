@@ -617,18 +617,9 @@ install_crowdsec() {
         return
     fi
 
-    # Install required dependencies
-    log_info "Installing dependencies..."
-    apt-get install -y curl gnupg apt-transport-https
-
-    # Add CrowdSec repository
+    # Add CrowdSec repository using official script
     log_info "Adding CrowdSec repository..."
-    curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey | gpg --dearmor -o /usr/share/keyrings/crowdsec-archive-keyring.gpg
-
-    echo "deb [signed-by=/usr/share/keyrings/crowdsec-archive-keyring.gpg] https://packagecloud.io/crowdsec/crowdsec/$OS/ $VERSION main" | tee /etc/apt/sources.list.d/crowdsec.list
-
-    # Update package list
-    apt-get update
+    curl -s https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.deb.sh | bash
 
     # Install CrowdSec
     log_info "Installing CrowdSec..."
