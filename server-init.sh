@@ -178,6 +178,36 @@ detect_os() {
     log_info "Detected OS: $OS $VERSION"
 }
 
+# Fix hostname resolution
+fix_hostname() {
+    log_info "Checking hostname configuration..."
+
+    local current_hostname=$(hostname)
+    local hosts_file="/etc/hosts"
+
+    # Check if hostname is already in /etc/hosts
+    if grep -q "127.0.1.1.*${current_hostname}" "$hosts_file"; then
+        log_info "Hostname already configured in /etc/hosts"
+        return
+    fi
+
+    log_info "Adding hostname to /etc/hosts..."
+
+    # Backup hosts file
+    cp "$hosts_file" "${hosts_file}.backup.$(date +%Y%m%d_%H%M%S)"
+
+    # Check if 127.0.1.1 line exists
+    if grep -q "^127.0.1.1" "$hosts_file"; then
+        # Update existing 127.0.1.1 line
+        sed -i "s/^127.0.1.1.*/127.0.1.1 ${current_hostname}/" "$hosts_file"
+    else
+        # Add new 127.0.1.1 line after 127.0.0.1
+        sed -i "/^127.0.0.1/a 127.0.1.1 ${current_hostname}" "$hosts_file"
+    fi
+
+    log_info "Hostname configuration fixed"
+}
+
 # Update system
 update_system() {
     log_info "Updating system packages..."
@@ -336,7 +366,7 @@ create_additional_users() {
 
         if [ -z "$username" ] || [ -z "$key_url" ]; then
             log_warn "Invalid user entry: $user_entry (skipping)"
-            ((fail_count++))
+            fail_count=$((fail_count + 1))
             continue
         fi
 
@@ -352,7 +382,7 @@ create_additional_users() {
                 log_info "User $username created"
             else
                 log_error "Failed to create user: $username"
-                ((fail_count++))
+                fail_count=$((fail_count + 1))
                 continue
             fi
         fi
@@ -383,14 +413,14 @@ create_additional_users() {
                 chown -R "$username:$username" "$ssh_dir"
 
                 log_info "SSH keys imported for $username"
-                ((success_count++))
+                success_count=$((success_count + 1))
             else
                 log_error "Downloaded keys file is empty for $username"
-                ((fail_count++))
+                fail_count=$((fail_count + 1))
             fi
         else
             log_error "Failed to download SSH keys for $username"
-            ((fail_count++))
+            fail_count=$((fail_count + 1))
         fi
     done
 
@@ -582,6 +612,7 @@ main() {
     parse_arguments "$@"
 
     detect_os
+    fix_hostname
 
     # Prompt for additional users if not specified via command line
     prompt_additional_users
