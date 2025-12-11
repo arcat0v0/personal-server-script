@@ -64,13 +64,15 @@ parse_arguments() {
                 echo "Options:"
                 echo "  -a, --add-users         Enable adding additional users (will prompt for details)"
                 echo "  -u, --users USERS       Specify additional users (semicolon-separated)"
-                echo "                          Format: username@key_url[:sudo]"
+                echo "                          Format: username@key_url[:sudo|:nopasswd]"
+                echo "                          :sudo     - Sudo access (password required)"
+                echo "                          :nopasswd - Sudo access (passwordless)"
                 echo "  -h, --help              Show this help message"
                 echo ""
                 echo "Examples:"
                 echo "  $0                                    # Run with interactive prompts"
                 echo "  $0 -a                                 # Enable additional users, will prompt for details"
-                echo "  $0 -u 'alice@https://github.com/alice.keys:sudo;bob@https://github.com/bob.keys'"
+                echo "  $0 -u 'alice@url:nopasswd;bob@url:sudo;charlie@url'"
                 exit 0
                 ;;
             *)
@@ -100,7 +102,7 @@ prompt_additional_users() {
         log_info "You can add multiple users. For each user, provide:"
         log_info "  - Username"
         log_info "  - SSH key URL (e.g., https://github.com/username.keys)"
-        log_info "  - Whether they should have sudo privileges"
+        log_info "  - Privileges (None, Sudo, or NOPASSWD)"
         echo ""
 
         local user_entries=""
@@ -123,21 +125,28 @@ prompt_additional_users() {
                 continue
             fi
 
-            read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Should $username have sudo privileges? \(y/N\): )" -n 1 -r < /dev/tty || sudo_flag=""
+            read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Should $username have sudo privileges? \(y/N\): )" -n 1 -r < /dev/tty || local sudo_choice=""
             echo ""
-            local sudo_flag=""
+            
+            local priv_suffix=""
             if [[ $REPLY =~ ^[Yy]$ ]]; then
-                sudo_flag=":sudo"
+                read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Enable passwordless sudo (NOPASSWD) for $username? \(y/N\): )" -n 1 -r < /dev/tty || local nopasswd_choice=""
+                echo ""
+                if [[ $REPLY =~ ^[Yy]$ ]]; then
+                    priv_suffix=":nopasswd"
+                else
+                    priv_suffix=":sudo"
+                fi
             fi
 
-            # Add to user entries (format: username@key_url[:sudo])
+            # Add to user entries (format: username@key_url[:sudo|:nopasswd])
             if [ -z "$user_entries" ]; then
-                user_entries="${username}@${key_url}${sudo_flag}"
+                user_entries="${username}@${key_url}${priv_suffix}"
             else
-                user_entries="${user_entries};${username}@${key_url}${sudo_flag}"
+                user_entries="${user_entries};${username}@${key_url}${priv_suffix}"
             fi
 
-            log_info "Added user: $username"
+            log_info "Added user: $username${priv_suffix}"
 
             echo ""
             read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Add another user? \(y/N\): )" -n 1 -r < /dev/tty || break
@@ -156,180 +165,7 @@ prompt_additional_users() {
     fi
 }
 
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-   log_error "This script must be run as root"
-   exit 1
-fi
-
-# Detect OS
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-        VERSION=$VERSION_ID
-    else
-        log_error "Cannot detect OS"
-        exit 1
-    fi
-
-    if [[ "$OS" != "debian" && "$OS" != "ubuntu" ]]; then
-        log_error "This script only supports Debian and Ubuntu"
-        exit 1
-    fi
-
-    log_info "Detected OS: $OS $VERSION"
-}
-
-# Fix hostname resolution
-fix_hostname() {
-    log_info "Checking hostname configuration..."
-
-    local current_hostname=$(hostname)
-    local hosts_file="/etc/hosts"
-
-    # Check if hostname is already in /etc/hosts
-    if grep -q "127.0.1.1.*${current_hostname}" "$hosts_file"; then
-        log_info "Hostname already configured in /etc/hosts"
-        return
-    fi
-
-    log_info "Adding hostname to /etc/hosts..."
-
-    # Backup hosts file
-    cp "$hosts_file" "${hosts_file}.backup.$(date +%Y%m%d_%H%M%S)"
-
-    # Check if 127.0.1.1 line exists
-    if grep -q "^127.0.1.1" "$hosts_file"; then
-        # Update existing 127.0.1.1 line
-        sed -i "s/^127.0.1.1.*/127.0.1.1 ${current_hostname}/" "$hosts_file"
-    else
-        # Add new 127.0.1.1 line after 127.0.0.1
-        sed -i "/^127.0.0.1/a 127.0.1.1 ${current_hostname}" "$hosts_file"
-    fi
-
-    log_info "Hostname configuration fixed"
-}
-
-# Update system
-update_system() {
-    log_info "Updating system packages..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get upgrade -y
-    apt-get dist-upgrade -y
-    apt-get autoremove -y
-    apt-get autoclean -y
-    log_info "System updated successfully"
-}
-
-# Create user arcat
-create_user() {
-    local username="arcat"
-
-    if id "$username" &>/dev/null; then
-        log_warn "User $username already exists, skipping creation"
-    else
-        log_info "Creating user $username..."
-        useradd -m -s /bin/bash "$username"
-        log_info "User $username created"
-    fi
-
-    # Add to sudo group
-    log_info "Adding $username to sudo group..."
-    usermod -aG sudo "$username"
-
-    # Configure passwordless sudo
-    log_info "Configuring passwordless sudo for $username..."
-    echo "$username ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$username
-    chmod 0440 /etc/sudoers.d/$username
-    log_info "Passwordless sudo configured"
-}
-
-# Detect if in China network
-is_china_network() {
-    # Try to detect China network by checking common indicators
-    # Method 1: Check if can reach GitHub quickly
-    if curl -s --connect-timeout 3 --max-time 5 https://github.com > /dev/null 2>&1; then
-        return 1  # Not in China or GitHub is accessible
-    fi
-
-    # Method 2: Check timezone
-    local timezone=$(timedatectl 2>/dev/null | grep "Time zone" | awk '{print $3}')
-    if [[ "$timezone" == "Asia/Shanghai" ]] || [[ "$timezone" == "Asia/Chongqing" ]] || [[ "$timezone" == "Asia/Urumqi" ]]; then
-        return 0  # Likely in China
-    fi
-
-    # Method 3: Check if common China DNS servers are reachable
-    if ping -c 1 -W 1 114.114.114.114 > /dev/null 2>&1 || ping -c 1 -W 1 223.5.5.5 > /dev/null 2>&1; then
-        return 0  # Likely in China
-    fi
-
-    return 1  # Default to not in China
-}
-
-# Import SSH keys from GitHub
-import_ssh_keys() {
-    local username="arcat"
-    local github_user="arcat0v0"
-    local ssh_dir="/home/$username/.ssh"
-    local github_url="https://github.com/${github_user}.keys"
-    local cf_worker_url="https://arcat_keys.xvx.rs"
-
-    log_info "Importing SSH keys from GitHub..."
-
-    # Create .ssh directory if not exists
-    mkdir -p "$ssh_dir"
-
-    # Detect network and choose appropriate URL
-    local keys_url="$github_url"
-    if is_china_network; then
-        log_info "Detected China network, using Cloudflare Worker proxy..."
-        keys_url="$cf_worker_url"
-    fi
-
-    # Try primary URL
-    log_info "Downloading keys from: $keys_url"
-    if curl -fsSL --connect-timeout 10 --max-time 30 "$keys_url" -o "$ssh_dir/authorized_keys"; then
-        log_info "SSH keys downloaded successfully"
-    else
-        log_warn "Failed to download from primary source, trying fallback..."
-
-        # Try fallback URL
-        if [ "$keys_url" = "$github_url" ]; then
-            # If GitHub failed, try Cloudflare Worker
-            log_info "Trying Cloudflare Worker proxy..."
-            if curl -fsSL --connect-timeout 10 --max-time 30 "$cf_worker_url" -o "$ssh_dir/authorized_keys"; then
-                log_info "SSH keys downloaded successfully via Cloudflare Worker"
-            else
-                log_error "Failed to download SSH keys from all sources"
-                exit 1
-            fi
-        else
-            # If Cloudflare Worker failed, try GitHub
-            log_info "Trying GitHub directly..."
-            if curl -fsSL --connect-timeout 10 --max-time 30 "$github_url" -o "$ssh_dir/authorized_keys"; then
-                log_info "SSH keys downloaded successfully from GitHub"
-            else
-                log_error "Failed to download SSH keys from all sources"
-                exit 1
-            fi
-        fi
-    fi
-
-    # Verify keys file is not empty
-    if [ ! -s "$ssh_dir/authorized_keys" ]; then
-        log_error "Downloaded keys file is empty"
-        exit 1
-    fi
-
-    # Set correct permissions
-    chmod 700 "$ssh_dir"
-    chmod 600 "$ssh_dir/authorized_keys"
-    chown -R "$username:$username" "$ssh_dir"
-
-    log_info "SSH keys imported and permissions set"
-}
+# ... (existing code) ...
 
 # Create additional users with their SSH keys
 create_additional_users() {
@@ -352,14 +188,15 @@ create_additional_users() {
             continue
         fi
 
-        # Parse user entry: username@key_url[:sudo]
-        # Using @ to separate username from URL to avoid conflicts with URL colons
-        local has_sudo=false
+        # Parse user entry: username@key_url[:sudo|:nopasswd]
+        local sudo_type="none"
 
-        # Check if entry ends with :sudo
-        if [[ "$user_entry" == *:sudo ]]; then
-            has_sudo=true
-            # Remove :sudo suffix
+        # Check suffixes
+        if [[ "$user_entry" == *:nopasswd ]]; then
+            sudo_type="nopasswd"
+            user_entry="${user_entry%:nopasswd}"
+        elif [[ "$user_entry" == *:sudo ]]; then
+            sudo_type="sudo"
             user_entry="${user_entry%:sudo}"
         fi
 
@@ -390,20 +227,28 @@ create_additional_users() {
             fi
         fi
 
-        # Add to sudo group if requested
-        if [ "$has_sudo" = true ]; then
+        # Configure sudo privileges
+        if [ "$sudo_type" != "none" ]; then
             log_info "Adding $username to sudo group..."
             usermod -aG sudo "$username"
 
-            # Configure passwordless sudo
-            echo "$username ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$username
+            if [ "$sudo_type" == "nopasswd" ]; then
+                # Configure passwordless sudo
+                echo "$username ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$username
+                log_info "Sudo privileges granted to $username (NOPASSWD)"
+            else
+                # Configure password-required sudo
+                echo "$username ALL=(ALL) ALL" > /etc/sudoers.d/$username
+                log_info "Sudo privileges granted to $username (password required)"
+            fi
+            
             chmod 0440 /etc/sudoers.d/$username
-            log_info "Sudo privileges granted to $username"
         fi
 
         # Import SSH keys
         local ssh_dir="/home/$username/.ssh"
         mkdir -p "$ssh_dir"
+
 
         log_info "Downloading SSH keys for $username from: $key_url"
 
@@ -568,43 +413,50 @@ configure_ufw() {
 
     log_info "Detected SSH port: $ssh_port"
 
-    # Disable UFW first to avoid issues
-    ufw --force disable
+    # Check if UFW is already active
+    if ufw status | grep -q "Status: active"; then
+        log_info "UFW is already active. Preserving existing rules."
+    else
+        # Disable UFW first to avoid issues
+        ufw --force disable
 
-    # Reset UFW to default
-    log_info "Resetting UFW to default configuration..."
-    ufw --force reset
+        # Reset UFW to default
+        log_info "Resetting UFW to default configuration..."
+        ufw --force reset
 
-    # Set default policies
-    log_info "Setting default policies (deny incoming, allow outgoing)..."
-    ufw default deny incoming
-    ufw default allow outgoing
+        # Set default policies
+        log_info "Setting default policies (deny incoming, allow outgoing)..."
+        ufw default deny incoming
+        ufw default allow outgoing
+    fi
 
     # Allow SSH (critical - must be first!)
-    log_info "Allowing SSH on port $ssh_port..."
+    log_info "Ensuring SSH is allowed on port $ssh_port..."
     ufw allow $ssh_port/tcp comment 'SSH'
 
     # Allow HTTP
-    log_info "Allowing HTTP (port 80)..."
-    ufw allow 80/tcp comment 'HTTP'
+    # log_info "Ensuring HTTP (port 80) is allowed..."
+    # ufw allow 80/tcp comment 'HTTP'
 
     # Allow HTTPS
-    log_info "Allowing HTTPS (port 443)..."
-    ufw allow 443/tcp comment 'HTTPS'
+    # log_info "Ensuring HTTPS (port 443) is allowed..."
+    # ufw allow 443/tcp comment 'HTTPS'
 
     # Allow Mosh
-    log_info "Allowing Mosh (UDP ports 60000-61000)..."
+    log_info "Ensuring Mosh (UDP ports 60000-61000) is allowed..."
     ufw allow 60000:61000/udp comment 'Mosh'
 
-    # Enable UFW
-    log_info "Enabling UFW..."
-    ufw --force enable
+    # Enable UFW if not already enabled
+    if ! ufw status | grep -q "Status: active"; then
+        log_info "Enabling UFW..."
+        ufw --force enable
+    fi
 
     # Show status
     log_info "UFW configuration completed. Current status:"
     ufw status verbose
 
-    log_warn "Firewall is now active. Only ports $ssh_port (SSH), 80 (HTTP), 443 (HTTPS), and 60000-61000 (Mosh) are open."
+    log_warn "Firewall is active. Ensure port $ssh_port (SSH) is accessible."
 }
 
 # Install and configure CrowdSec
@@ -619,7 +471,11 @@ install_crowdsec() {
 
     # Add CrowdSec repository using official script
     log_info "Adding CrowdSec repository..."
-    curl -s https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.deb.sh | bash
+    curl -s https://install.crowdsec.net | sh
+    
+    # Update package lists to ensure the new repository is recognized
+    log_info "Updating package lists..."
+    apt-get update -y
 
     # Install CrowdSec
     log_info "Installing CrowdSec..."

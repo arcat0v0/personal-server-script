@@ -61,17 +61,20 @@ sudo ./server-init.sh -h
 # 启用额外用户创建（会提示输入详细信息）
 sudo ./server-init.sh -a
 
-# 直接指定额外用户（格式：username@key_url[:sudo]，多个用户用分号分隔）
-sudo ./server-init.sh -u 'alice@https://github.com/alice.keys:sudo;bob@https://github.com/bob.keys'
+# 直接指定额外用户（格式：username@key_url[:sudo|:nopasswd]，多个用户用分号分隔）
+# :sudo     - Sudo 访问（需要密码）
+# :nopasswd - Sudo 访问（免密）
+sudo ./server-init.sh -u 'alice@https://github.com/alice.keys:nopasswd;bob@https://github.com/bob.keys:sudo;charlie@https://github.com/charlie.keys'
 ```
 
 **参数说明：**
 - `-a, --add-users`: 启用额外用户创建功能，脚本会交互式提示输入用户信息
-- `-u, --users`: 直接指定额外用户信息，格式为 `username@key_url[:sudo]`
+- `-u, --users`: 直接指定额外用户信息，格式为 `username@key_url[:sudo|:nopasswd]`
   - `username`: 用户名
   - `@`: 分隔符（使用 @ 避免与 URL 中的冒号冲突）
   - `key_url`: SSH 密钥 URL（如 `https://github.com/username.keys`）
-  - `:sudo`: 可选，表示该用户拥有 sudo 权限
+  - `:sudo`: 可选，表示该用户拥有需密码的 sudo 权限
+  - `:nopasswd`: 可选，表示该用户拥有免密 sudo 权限
   - 多个用户用分号 `;` 分隔
 - `-h, --help`: 显示帮助信息
 
@@ -104,7 +107,7 @@ sudo ./server-init.sh -u 'alice@https://github.com/alice.keys:sudo;bob@https://g
 **额外用户（可选）：**
 - 支持创建多个额外用户
 - 每个用户拥有独立的账户和 home 目录
-- 可为每个用户单独配置 sudo 权限
+- 可为每个用户单独配置 sudo 权限（需密码或免密）
 - 从指定的 URL 导入各自的 SSH 公钥
 - 支持交互式输入或命令行参数指定
 - 如果用户已存在，会更新其 SSH 密钥
@@ -143,14 +146,13 @@ sudo ./server-init.sh -u 'alice@https://github.com/alice.keys:sudo;bob@https://g
 
 #### 6. UFW 防火墙配置
 - 自动安装和配置 UFW（Uncomplicated Firewall）
+- **如果 UFW 已激活，将保留现有规则，并确保 SSH、Mosh 端口开放。**
 - 自动检测 SSH 端口并确保其开放
-- 设置默认策略：拒绝所有入站连接，允许所有出站连接
+- 设置默认策略：拒绝所有入站连接，允许所有出站连接（仅当 UFW 未激活时重置）
 - 开放必要端口：
   - SSH（默认 22，或从配置文件检测）
-  - HTTP（80）
-  - HTTPS（443）
   - Mosh（60000-61000/UDP）
-- 自动备份和重置防火墙配置
+  - **HTTP（80）和 HTTPS（443）端口默认被注释，如需启用请取消注释脚本中的相关行。**
 - 显示防火墙状态和规则
 
 #### 7. CrowdSec 入侵防御系统
@@ -194,38 +196,6 @@ sudo cscli decisions delete --ip 1.2.3.4
 - 检测 BBR 模块是否可用
 - 自动启用 BBR 拥塞控制算法
 - 配置 fq 队列调度算法
-
-## 安全提示
-
-⚠️ **重要：** 脚本执行完成后，请务必在关闭当前 SSH 会话之前：
-
-1. 打开一个新的终端窗口
-2. 使用新创建的 `arcat` 用户测试 SSH 登录
-3. 确认可以正常登录并使用 sudo
-4. 如果创建了额外用户，也要测试这些用户的登录
-5. 确认无误后再关闭原有的 root 会话
-
-```bash
-# 在新终端测试主用户 SSH 登录
-ssh arcat@your-server-ip
-
-# 或使用 mosh 连接（推荐）
-mosh arcat@your-server-ip
-
-# 测试 sudo 权限
-sudo whoami
-
-# 如果创建了额外用户，也要测试
-ssh alice@your-server-ip
-ssh bob@your-server-ip
-```
-
-**多用户管理建议：**
-- 为不同的团队成员创建独立的用户账户
-- 根据实际需要分配 sudo 权限，遵循最小权限原则
-- 定期审查用户列表和权限配置
-- 使用 `last` 命令查看用户登录历史
-- 使用 `w` 或 `who` 命令查看当前登录用户
 
 ## Cloudflare Worker 配置（可选）
 
@@ -276,66 +246,6 @@ local cf_worker_url="https://arcat-keys.xvx.rs"
 - **Cloudflare Worker URL**：修改 `cf_worker_url` 为你的 Worker 地址
 - **zsh 插件**：在 `install_zsh()` 函数中添加或删除插件
 - **额外用户**：使用 `-u` 参数或交互式提示添加额外用户
-
-### 额外用户配置示例
-
-**场景 1：团队协作服务器**
-```bash
-# 创建开发团队成员账户，部分成员有 sudo 权限
-sudo ./server-init.sh -u 'alice@https://github.com/alice.keys:sudo;bob@https://github.com/bob.keys;charlie@https://github.com/charlie.keys:sudo'
-```
-
-**场景 2：个人多账户**
-```bash
-# 为自己创建多个账户用于不同用途
-sudo ./server-init.sh -u 'work@https://github.com/mywork.keys:sudo;personal@https://github.com/mypersonal.keys'
-```
-
-**场景 3：临时访客账户**
-```bash
-# 为临时访客创建无 sudo 权限的账户
-sudo ./server-init.sh -u 'guest@https://github.com/guest.keys'
-```
-
-## 故障排除
-
-### 无法连接到服务器
-- 确保在测试新用户登录成功之前不要关闭原有的 SSH 会话
-- 检查 SSH 公钥是否正确导入到 `~/.ssh/authorized_keys`
-- 检查 SSH 服务是否正常运行：`systemctl status ssh`
-
-### BBR 未启用
-- 检查内核版本：`uname -r`（需要 4.9+）
-- 检查 BBR 模块：`lsmod | grep bbr`
-- 手动验证：`sysctl net.ipv4.tcp_congestion_control`
-
-### oh-my-zsh 安装失败
-- 检查网络连接
-- 手动安装：`sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"`
-
-### Mosh 连接问题
-- 确保防火墙开放 UDP 端口 60000-61000
-- 检查 mosh 是否安装：`which mosh`
-- 本地也需要安装 mosh 客户端才能使用
-
-### SSH 密钥下载失败
-- 检查网络连接是否正常
-- 如果在国内，确保已配置 Cloudflare Worker
-- 手动测试密钥 URL：`curl -I https://github.com/arcat0v0.keys`
-- 检查 GitHub 用户名是否正确
-- 验证 Worker 是否正常工作：`curl https://your-worker-url`
-
-### 额外用户创建失败
-- **用户名冲突**：检查用户是否已存在 `id username`
-- **密钥 URL 无效**：确保 URL 格式正确且可访问
-- **权限问题**：确保以 root 身份运行脚本
-- **格式错误**：检查参数格式是否正确
-  - 正确格式：`username@key_url[:sudo]`
-  - 多个用户用分号分隔：`user1@url1;user2@url2:sudo`
-  - 示例：`alice@https://github.com/alice.keys:sudo`
-- **查看创建的用户**：`cat /etc/passwd | grep -E "arcat|alice|bob"`
-- **检查 SSH 密钥**：`cat /home/username/.ssh/authorized_keys`
-- **验证 sudo 权限**：`sudo -l -U username`
 
 ## 贡献
 
