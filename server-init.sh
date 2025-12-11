@@ -7,6 +7,8 @@
 # - Disable root login
 # - Create sudo user 'arcat'
 # - Import SSH keys from GitHub
+# - Create additional users with their SSH keys (optional)
+# - Configure sudo privileges for additional users
 # - Update system
 # - Install and configure zsh with oh-my-zsh
 # - Install and configure starship prompt
@@ -16,6 +18,10 @@
 #############################################
 
 set -e
+
+# Global variables
+ADDITIONAL_USERS=""
+ADD_ADDITIONAL_USERS=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -34,6 +40,117 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Parse command line arguments
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -a|--add-users)
+                ADD_ADDITIONAL_USERS=true
+                shift
+                ;;
+            -u|--users)
+                ADDITIONAL_USERS="$2"
+                ADD_ADDITIONAL_USERS=true
+                shift 2
+                ;;
+            -h|--help)
+                echo "Usage: $0 [OPTIONS]"
+                echo ""
+                echo "Options:"
+                echo "  -a, --add-users         Enable adding additional users (will prompt for details)"
+                echo "  -u, --users USERS       Specify additional users (semicolon-separated)"
+                echo "                          Format: username:key_url[:sudo]"
+                echo "  -h, --help              Show this help message"
+                echo ""
+                echo "Examples:"
+                echo "  $0                                    # Run with interactive prompts"
+                echo "  $0 -a                                 # Enable additional users, will prompt for details"
+                echo "  $0 -u 'alice:https://github.com/alice.keys:sudo;bob:https://github.com/bob.keys'"
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                echo "Use -h or --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Interactive prompt for additional users
+prompt_additional_users() {
+    if [ "$ADD_ADDITIONAL_USERS" = false ]; then
+        echo ""
+        read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Do you want to create additional users? \(y/N\): )" -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            ADD_ADDITIONAL_USERS=true
+        else
+            return
+        fi
+    fi
+
+    if [ "$ADD_ADDITIONAL_USERS" = true ] && [ -z "$ADDITIONAL_USERS" ]; then
+        echo ""
+        log_info "You can add multiple users. For each user, provide:"
+        log_info "  - Username"
+        log_info "  - SSH key URL (e.g., https://github.com/username.keys)"
+        log_info "  - Whether they should have sudo privileges"
+        echo ""
+
+        local user_entries=""
+        local continue_adding=true
+
+        while [ "$continue_adding" = true ]; do
+            echo -e "${YELLOW}[PROMPT]${NC} Enter username:"
+            read -r username
+
+            if [ -z "$username" ]; then
+                log_warn "Username cannot be empty"
+                continue
+            fi
+
+            echo -e "${YELLOW}[PROMPT]${NC} Enter SSH key URL for $username:"
+            read -r key_url
+
+            if [ -z "$key_url" ]; then
+                log_warn "Key URL cannot be empty"
+                continue
+            fi
+
+            read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Should $username have sudo privileges? \(y/N\): )" -n 1 -r
+            echo ""
+            local sudo_flag=""
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                sudo_flag=":sudo"
+            fi
+
+            # Add to user entries
+            if [ -z "$user_entries" ]; then
+                user_entries="${username}:${key_url}${sudo_flag}"
+            else
+                user_entries="${user_entries};${username}:${key_url}${sudo_flag}"
+            fi
+
+            log_info "Added user: $username"
+
+            echo ""
+            read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Add another user? \(y/N\): )" -n 1 -r
+            echo ""
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                continue_adding=false
+            fi
+        done
+
+        ADDITIONAL_USERS="$user_entries"
+
+        if [ -z "$ADDITIONAL_USERS" ]; then
+            log_warn "No users provided, skipping additional users"
+            ADD_ADDITIONAL_USERS=false
+        fi
+    fi
 }
 
 # Check if running as root
@@ -179,6 +296,101 @@ import_ssh_keys() {
     chown -R "$username:$username" "$ssh_dir"
 
     log_info "SSH keys imported and permissions set"
+}
+
+# Create additional users with their SSH keys
+create_additional_users() {
+    if [ "$ADD_ADDITIONAL_USERS" = false ] || [ -z "$ADDITIONAL_USERS" ]; then
+        return
+    fi
+
+    log_info "Creating additional users..."
+
+    # Split semicolon-separated user entries
+    IFS=';' read -ra USER_ENTRIES <<< "$ADDITIONAL_USERS"
+    local success_count=0
+    local fail_count=0
+
+    for user_entry in "${USER_ENTRIES[@]}"; do
+        # Trim whitespace
+        user_entry=$(echo "$user_entry" | xargs)
+
+        if [ -z "$user_entry" ]; then
+            continue
+        fi
+
+        # Parse user entry: username:key_url[:sudo]
+        IFS=':' read -ra USER_PARTS <<< "$user_entry"
+        local username="${USER_PARTS[0]}"
+        local key_url="${USER_PARTS[1]}"
+        local has_sudo=false
+
+        # Check if sudo flag is present
+        if [ "${#USER_PARTS[@]}" -ge 3 ] && [ "${USER_PARTS[2]}" = "sudo" ]; then
+            has_sudo=true
+        fi
+
+        if [ -z "$username" ] || [ -z "$key_url" ]; then
+            log_warn "Invalid user entry: $user_entry (skipping)"
+            ((fail_count++))
+            continue
+        fi
+
+        log_info "Creating user: $username"
+
+        # Check if user already exists
+        if id "$username" &>/dev/null; then
+            log_warn "User $username already exists, skipping creation"
+            log_info "Updating SSH keys for existing user: $username"
+        else
+            # Create user
+            if useradd -m -s /bin/bash "$username"; then
+                log_info "User $username created"
+            else
+                log_error "Failed to create user: $username"
+                ((fail_count++))
+                continue
+            fi
+        fi
+
+        # Add to sudo group if requested
+        if [ "$has_sudo" = true ]; then
+            log_info "Adding $username to sudo group..."
+            usermod -aG sudo "$username"
+
+            # Configure passwordless sudo
+            echo "$username ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$username
+            chmod 0440 /etc/sudoers.d/$username
+            log_info "Sudo privileges granted to $username"
+        fi
+
+        # Import SSH keys
+        local ssh_dir="/home/$username/.ssh"
+        mkdir -p "$ssh_dir"
+
+        log_info "Downloading SSH keys for $username from: $key_url"
+
+        if curl -fsSL --connect-timeout 10 --max-time 30 "$key_url" -o "$ssh_dir/authorized_keys"; then
+            # Verify keys file is not empty
+            if [ -s "$ssh_dir/authorized_keys" ]; then
+                # Set correct permissions
+                chmod 700 "$ssh_dir"
+                chmod 600 "$ssh_dir/authorized_keys"
+                chown -R "$username:$username" "$ssh_dir"
+
+                log_info "SSH keys imported for $username"
+                ((success_count++))
+            else
+                log_error "Downloaded keys file is empty for $username"
+                ((fail_count++))
+            fi
+        else
+            log_error "Failed to download SSH keys for $username"
+            ((fail_count++))
+        fi
+    done
+
+    log_info "Additional users creation completed: $success_count succeeded, $fail_count failed"
 }
 
 # Disable root login
@@ -362,10 +574,18 @@ main() {
     log_info "Starting server initialization..."
     echo ""
 
+    # Parse command line arguments
+    parse_arguments "$@"
+
     detect_os
+
+    # Prompt for additional users if not specified via command line
+    prompt_additional_users
+
     update_system
     create_user
     import_ssh_keys
+    create_additional_users
     disable_root_login
     install_zsh
     install_direnv
@@ -379,6 +599,11 @@ main() {
     log_info "=========================================="
     log_info "User 'arcat' has been created with sudo privileges"
     log_info "SSH keys imported from GitHub"
+
+    if [ "$ADD_ADDITIONAL_USERS" = true ]; then
+        log_info "Additional users have been created (if any)"
+    fi
+
     log_info "Root login has been disabled"
     log_info "Zsh with oh-my-zsh has been installed"
     log_info "Starship prompt has been configured with plain-text-symbols preset"
