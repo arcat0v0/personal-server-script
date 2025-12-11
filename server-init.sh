@@ -91,7 +91,7 @@ prompt_additional_users() {
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             ADD_ADDITIONAL_USERS=true
         else
-            return
+            return 0
         fi
     fi
 
