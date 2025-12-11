@@ -86,7 +86,7 @@ parse_arguments() {
 prompt_additional_users() {
     if [ "$ADD_ADDITIONAL_USERS" = false ]; then
         echo ""
-        read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Do you want to create additional users? \(y/N\): )" -n 1 -r
+        read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Do you want to create additional users? \(y/N\): )" -n 1 -r < /dev/tty || return 0
         echo ""
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             ADD_ADDITIONAL_USERS=true
@@ -108,7 +108,7 @@ prompt_additional_users() {
 
         while [ "$continue_adding" = true ]; do
             echo -e "${YELLOW}[PROMPT]${NC} Enter username:"
-            read -r username
+            read -r username < /dev/tty || break
 
             if [ -z "$username" ]; then
                 log_warn "Username cannot be empty"
@@ -116,14 +116,14 @@ prompt_additional_users() {
             fi
 
             echo -e "${YELLOW}[PROMPT]${NC} Enter SSH key URL for $username:"
-            read -r key_url
+            read -r key_url < /dev/tty || break
 
             if [ -z "$key_url" ]; then
                 log_warn "Key URL cannot be empty"
                 continue
             fi
 
-            read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Should $username have sudo privileges? \(y/N\): )" -n 1 -r
+            read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Should $username have sudo privileges? \(y/N\): )" -n 1 -r < /dev/tty || sudo_flag=""
             echo ""
             local sudo_flag=""
             if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -140,7 +140,7 @@ prompt_additional_users() {
             log_info "Added user: $username"
 
             echo ""
-            read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Add another user? \(y/N\): )" -n 1 -r
+            read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Add another user? \(y/N\): )" -n 1 -r < /dev/tty || break
             echo ""
             if [[ ! $REPLY =~ ^[Yy]$ ]]; then
                 continue_adding=false
