@@ -5,7 +5,10 @@
 ## 功能特性
 
 - ✅ **系统支持** - 支持 Debian 和 Ubuntu 系统
+- 🔧 **系统配置** - 自动修复 hostname 解析问题
 - 🔒 **安全加固** - 禁用 root 登录，强制使用 SSH 密钥认证
+- 🛡️ **防火墙配置** - 自动配置 UFW 防火墙，只开放必要端口
+- 🚨 **入侵防御** - 集成 CrowdSec 防御 SSH 暴力破解和其他攻击
 - 👤 **用户管理** - 自动创建 sudo 用户，配置无密码 sudo 权限
 - 👥 **多用户支持** - 支持创建额外用户，可单独配置 sudo 权限
 - 🔑 **SSH 密钥** - 从 GitHub 自动导入 SSH 公钥，支持国内网络自动切换镜像
@@ -83,8 +86,10 @@ sudo ./server-init.sh -u 'alice@https://github.com/alice.keys:sudo;bob@https://g
 
 ### 脚本功能详解
 
-#### 1. 系统检测与更新
+#### 1. 系统检测与配置
 - 自动检测操作系统类型和版本
+- 修复 hostname 解析问题，避免 sudo 警告
+- 自动备份 `/etc/hosts` 文件
 - 执行完整的系统更新（update、upgrade、dist-upgrade）
 - 清理不需要的软件包
 
@@ -133,11 +138,58 @@ sudo ./server-init.sh -u 'alice@https://github.com/alice.keys:sudo;bob@https://g
 
 #### 5. Mosh 安装
 - 安装 mosh（Mobile Shell）提供更稳定的远程连接
-- 自动配置防火墙规则（如果启用了 ufw）
 - 支持断线重连、网络切换等场景
 - 使用 UDP 端口 60000-61000
 
-#### 6. BBR 加速
+#### 6. UFW 防火墙配置
+- 自动安装和配置 UFW（Uncomplicated Firewall）
+- 自动检测 SSH 端口并确保其开放
+- 设置默认策略：拒绝所有入站连接，允许所有出站连接
+- 开放必要端口：
+  - SSH（默认 22，或从配置文件检测）
+  - HTTP（80）
+  - HTTPS（443）
+  - Mosh（60000-61000/UDP）
+- 自动备份和重置防火墙配置
+- 显示防火墙状态和规则
+
+#### 7. CrowdSec 入侵防御系统
+- 自动安装和配置 CrowdSec
+- 安装 SSH 防护场景集合
+- 安装 Linux 基础防护集合
+- 配置防火墙 bouncer（与 iptables 集成）
+- 自动检测和阻止恶意行为：
+  - SSH 暴力破解攻击
+  - 端口扫描
+  - 其他可疑活动
+- 与全球威胁情报网络共享和接收威胁信息
+- 提供实时监控和告警
+
+**CrowdSec 常用命令：**
+```bash
+# 查看告警
+sudo cscli alerts list
+
+# 查看当前封禁的 IP
+sudo cscli decisions list
+
+# 查看指标统计
+sudo cscli metrics
+
+# 查看已安装的场景
+sudo cscli scenarios list
+
+# 查看已安装的集合
+sudo cscli collections list
+
+# 手动封禁 IP
+sudo cscli decisions add --ip 1.2.3.4 --duration 4h --reason "manual ban"
+
+# 解封 IP
+sudo cscli decisions delete --ip 1.2.3.4
+```
+
+#### 8. BBR 加速
 - 检测内核版本是否支持 BBR（需要 4.9+）
 - 检测 BBR 模块是否可用
 - 自动启用 BBR 拥塞控制算法

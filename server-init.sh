@@ -4,6 +4,7 @@
 # Server Initialization Script
 # Supports: Debian, Ubuntu
 # Features:
+# - Fix hostname resolution
 # - Disable root login
 # - Create sudo user 'arcat'
 # - Import SSH keys from GitHub
@@ -14,6 +15,8 @@
 # - Install and configure starship prompt
 # - Install and configure direnv
 # - Install mosh for better remote connections
+# - Configure UFW firewall (SSH, HTTP, HTTPS, Mosh)
+# - Install and configure CrowdSec for intrusion prevention
 # - Enable BBR if supported
 #############################################
 
@@ -532,14 +535,124 @@ install_mosh() {
 
     apt-get install -y mosh
 
-    # Open mosh ports in firewall if ufw is active
-    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
-        log_info "Configuring firewall for mosh..."
-        ufw allow 60000:61000/udp
-        log_info "Firewall rules added for mosh (UDP ports 60000-61000)"
+    log_info "Mosh installed successfully"
+}
+
+# Configure UFW firewall
+configure_ufw() {
+    log_info "Configuring UFW firewall..."
+
+    # Install ufw if not present
+    if ! command -v ufw &>/dev/null; then
+        log_info "Installing UFW..."
+        apt-get install -y ufw
     fi
 
-    log_info "Mosh installed successfully"
+    # Detect SSH port from sshd_config
+    local ssh_port=$(grep -E "^Port " /etc/ssh/sshd_config | awk '{print $2}')
+    if [ -z "$ssh_port" ]; then
+        ssh_port=22
+    fi
+
+    log_info "Detected SSH port: $ssh_port"
+
+    # Disable UFW first to avoid issues
+    ufw --force disable
+
+    # Reset UFW to default
+    log_info "Resetting UFW to default configuration..."
+    ufw --force reset
+
+    # Set default policies
+    log_info "Setting default policies (deny incoming, allow outgoing)..."
+    ufw default deny incoming
+    ufw default allow outgoing
+
+    # Allow SSH (critical - must be first!)
+    log_info "Allowing SSH on port $ssh_port..."
+    ufw allow $ssh_port/tcp comment 'SSH'
+
+    # Allow HTTP
+    log_info "Allowing HTTP (port 80)..."
+    ufw allow 80/tcp comment 'HTTP'
+
+    # Allow HTTPS
+    log_info "Allowing HTTPS (port 443)..."
+    ufw allow 443/tcp comment 'HTTPS'
+
+    # Allow Mosh
+    log_info "Allowing Mosh (UDP ports 60000-61000)..."
+    ufw allow 60000:61000/udp comment 'Mosh'
+
+    # Enable UFW
+    log_info "Enabling UFW..."
+    ufw --force enable
+
+    # Show status
+    log_info "UFW configuration completed. Current status:"
+    ufw status verbose
+
+    log_warn "Firewall is now active. Only ports $ssh_port (SSH), 80 (HTTP), 443 (HTTPS), and 60000-61000 (Mosh) are open."
+}
+
+# Install and configure CrowdSec
+install_crowdsec() {
+    log_info "Installing CrowdSec for intrusion prevention..."
+
+    # Check if CrowdSec is already installed
+    if command -v cscli &>/dev/null; then
+        log_warn "CrowdSec is already installed, skipping installation"
+        return
+    fi
+
+    # Install required dependencies
+    log_info "Installing dependencies..."
+    apt-get install -y curl gnupg apt-transport-https
+
+    # Add CrowdSec repository
+    log_info "Adding CrowdSec repository..."
+    curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey | gpg --dearmor -o /usr/share/keyrings/crowdsec-archive-keyring.gpg
+
+    echo "deb [signed-by=/usr/share/keyrings/crowdsec-archive-keyring.gpg] https://packagecloud.io/crowdsec/crowdsec/$OS/ $VERSION main" | tee /etc/apt/sources.list.d/crowdsec.list
+
+    # Update package list
+    apt-get update
+
+    # Install CrowdSec
+    log_info "Installing CrowdSec..."
+    apt-get install -y crowdsec
+
+    # Install firewall bouncer
+    log_info "Installing CrowdSec firewall bouncer..."
+    apt-get install -y crowdsec-firewall-bouncer-iptables
+
+    # Enable and start CrowdSec service
+    log_info "Enabling CrowdSec service..."
+    systemctl enable crowdsec
+    systemctl start crowdsec
+
+    # Wait for CrowdSec to initialize
+    sleep 5
+
+    # Install SSH collection (should be installed by default, but ensure it)
+    log_info "Ensuring SSH protection collection is installed..."
+    cscli collections install crowdsecurity/sshd || log_warn "SSH collection may already be installed"
+
+    # Install Linux base collection
+    log_info "Installing Linux base collection..."
+    cscli collections install crowdsecurity/linux || log_warn "Linux collection may already be installed"
+
+    # Reload CrowdSec to apply collections
+    log_info "Reloading CrowdSec..."
+    systemctl reload crowdsec
+
+    # Show CrowdSec status
+    log_info "CrowdSec installation completed. Status:"
+    cscli metrics
+
+    log_info "CrowdSec is now protecting your server against SSH brute-force and other attacks"
+    log_info "You can view alerts with: sudo cscli alerts list"
+    log_info "You can view decisions (bans) with: sudo cscli decisions list"
 }
 
 # Enable BBR if supported
@@ -625,6 +738,8 @@ main() {
     install_zsh
     install_direnv
     install_mosh
+    configure_ufw
+    install_crowdsec
     enable_bbr
     restart_ssh
 
@@ -639,15 +754,23 @@ main() {
         log_info "Additional users have been created (if any)"
     fi
 
+    log_info "Hostname resolution has been configured"
     log_info "Root login has been disabled"
     log_info "Zsh with oh-my-zsh has been installed"
     log_info "Starship prompt has been configured with plain-text-symbols preset"
     log_info "Direnv has been installed and configured"
     log_info "Mosh has been installed for better remote connections"
+    log_info "UFW firewall has been configured and enabled"
+    log_info "CrowdSec has been installed for intrusion prevention"
     log_info "BBR has been checked and enabled if supported"
     log_info ""
     log_warn "IMPORTANT: Please test SSH login with user 'arcat' before closing this session!"
     log_info "You can also connect using: mosh arcat@your-server-ip"
+    log_info ""
+    log_info "CrowdSec commands:"
+    log_info "  - View alerts: sudo cscli alerts list"
+    log_info "  - View bans: sudo cscli decisions list"
+    log_info "  - View metrics: sudo cscli metrics"
     log_info "=========================================="
 }
 
