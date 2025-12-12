@@ -45,6 +45,80 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Command helpers
+has_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Detect OS and set package/service helpers.
+detect_os() {
+    if [ "$(id -u)" -ne 0 ]; then
+        log_error "This script must be run as root."
+        exit 1
+    fi
+
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        OS_ID="${ID:-unknown}"
+        OS_VERSION="${VERSION_ID:-unknown}"
+    else
+        OS_ID="unknown"
+        OS_VERSION="unknown"
+    fi
+
+    case "$OS_ID" in
+        debian|ubuntu)
+            log_info "Detected OS: $OS_ID $OS_VERSION"
+            ;;
+        *)
+            log_warn "Unsupported OS: $OS_ID $OS_VERSION. Will try to continue best-effort."
+            ;;
+    esac
+
+    if has_cmd apt-get; then
+        PKG_UPDATE="apt-get update -y"
+        PKG_INSTALL="apt-get install -y"
+    elif has_cmd apt; then
+        PKG_UPDATE="apt update -y"
+        PKG_INSTALL="apt install -y"
+    else
+        log_error "No supported package manager found (apt-get/apt)."
+        exit 1
+    fi
+
+    # Bootstrap essential tools used early in the script.
+    if ! has_cmd curl; then
+        log_info "curl not found, installing..."
+        $PKG_UPDATE
+        $PKG_INSTALL curl ca-certificates
+    fi
+
+    if has_cmd systemctl; then
+        SERVICE_RESTART() { systemctl restart "$1"; }
+        SERVICE_START() { systemctl start "$1"; }
+        SERVICE_ENABLE() { systemctl enable "$1"; }
+        SERVICE_RELOAD() { systemctl reload "$1"; }
+    elif has_cmd service; then
+        SERVICE_RESTART() { service "$1" restart; }
+        SERVICE_START() { service "$1" start; }
+        SERVICE_ENABLE() {
+            if has_cmd update-rc.d; then
+                update-rc.d "$1" defaults >/dev/null 2>&1 || true
+            else
+                log_warn "Cannot enable service $1 (systemctl/update-rc.d not found)."
+            fi
+        }
+        SERVICE_RELOAD() { service "$1" reload || service "$1" restart; }
+    else
+        log_warn "No service manager found (systemctl/service). Service operations may fail."
+        SERVICE_RESTART() { log_warn "Skipping restart for $1"; }
+        SERVICE_START() { log_warn "Skipping start for $1"; }
+        SERVICE_ENABLE() { log_warn "Skipping enable for $1"; }
+        SERVICE_RELOAD() { log_warn "Skipping reload for $1"; }
+    fi
+}
+
 # Parse command line arguments
 parse_arguments() {
     while [[ $# -gt 0 ]]; do
@@ -125,12 +199,13 @@ prompt_additional_users() {
                 continue
             fi
 
-            read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Should $username have sudo privileges? \(y/N\): )" -n 1 -r < /dev/tty || local sudo_choice=""
+            # Use printf with proper quoting to avoid bare parentheses causing bash parse errors.
+            read -p "$(printf "%b" "${YELLOW}[PROMPT]${NC} Should $username have sudo privileges? (y/N): ")" -n 1 -r < /dev/tty || local sudo_choice=""
             echo ""
             
             local priv_suffix=""
             if [[ $REPLY =~ ^[Yy]$ ]]; then
-                read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Enable passwordless sudo (NOPASSWD) for $username? \(y/N\): )" -n 1 -r < /dev/tty || local nopasswd_choice=""
+                read -p "$(printf "%b" "${YELLOW}[PROMPT]${NC} Enable passwordless sudo (NOPASSWD) for $username? (y/N): ")" -n 1 -r < /dev/tty || local nopasswd_choice=""
                 echo ""
                 if [[ $REPLY =~ ^[Yy]$ ]]; then
                     priv_suffix=":nopasswd"
@@ -165,7 +240,137 @@ prompt_additional_users() {
     fi
 }
 
-# ... (existing code) ...
+# Fix hostname resolution issues (avoid sudo warnings).
+fix_hostname() {
+    log_info "Fixing hostname resolution..."
+
+    local hostname
+    hostname="$(hostname)"
+
+    if [ -z "$hostname" ]; then
+        log_warn "Unable to determine hostname, skipping"
+        return
+    fi
+
+    local hosts_file="/etc/hosts"
+    cp "$hosts_file" "${hosts_file}.backup.$(date +%Y%m%d_%H%M%S)"
+
+    # Ensure 127.0.1.1 maps to hostname on Debian/Ubuntu.
+    if grep -qE "^127\\.0\\.1\\.1\\s+" "$hosts_file"; then
+        if ! grep -qE "^127\\.0\\.1\\.1\\s+.*\\b${hostname}\\b" "$hosts_file"; then
+            sed -i "s/^127\\.0\\.1\\.1\\s\\+.*/127.0.1.1\t${hostname}/" "$hosts_file"
+        fi
+    else
+        echo -e "127.0.1.1\t${hostname}" >> "$hosts_file"
+    fi
+
+    log_info "Hostname resolution fixed for: $hostname"
+}
+
+# Install common base tools (vim, etc.).
+install_common_tools() {
+    log_info "Installing common tools..."
+
+    local pkgs=(
+        vim
+        nano
+        less
+        htop
+        tmux
+        unzip
+        zip
+        rsync
+        lsof
+        net-tools
+        jq
+        wget
+        git
+        ca-certificates
+        gnupg
+        sudo
+    )
+
+    $PKG_INSTALL "${pkgs[@]}"
+    log_info "Common tools installed"
+}
+
+# Update system packages.
+update_system() {
+    log_info "Updating system packages..."
+
+    $PKG_UPDATE
+
+    if has_cmd apt-get; then
+        DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+        DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y
+        apt-get autoremove -y
+        apt-get autoclean -y
+    else
+        DEBIAN_FRONTEND=noninteractive apt upgrade -y
+        DEBIAN_FRONTEND=noninteractive apt full-upgrade -y
+        apt autoremove -y
+        apt autoclean -y
+    fi
+
+    install_common_tools
+    log_info "System update completed"
+}
+
+# Create main sudo user.
+create_user() {
+    local username="arcat"
+
+    log_info "Creating main user: $username"
+
+    if id "$username" &>/dev/null; then
+        log_warn "User $username already exists, skipping creation"
+    else
+        useradd -m -s /bin/bash "$username"
+        log_info "User $username created"
+    fi
+
+    usermod -aG sudo "$username"
+
+    # Configure passwordless sudo
+    echo "$username ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$username"
+    chmod 0440 "/etc/sudoers.d/$username"
+
+    log_info "User $username granted sudo privileges (NOPASSWD)"
+}
+
+# Import SSH keys for main user from GitHub (with CF mirror fallback).
+import_ssh_keys() {
+    local username="arcat"
+    local github_user="arcat0v0"
+    local primary_url="https://github.com/${github_user}.keys"
+    local cf_worker_url="https://arcat_keys.xvx.rs"
+    local mirror_url="${cf_worker_url}/${github_user}.keys"
+
+    log_info "Importing SSH keys for $username..."
+
+    local ssh_dir="/home/$username/.ssh"
+    mkdir -p "$ssh_dir"
+
+    if curl -fsSL --connect-timeout 10 --max-time 30 "$primary_url" -o "$ssh_dir/authorized_keys"; then
+        log_info "Downloaded SSH keys from GitHub"
+    elif curl -fsSL --connect-timeout 10 --max-time 30 "$mirror_url" -o "$ssh_dir/authorized_keys"; then
+        log_warn "GitHub unreachable, downloaded keys from mirror"
+    else
+        log_error "Failed to download SSH keys from both GitHub and mirror"
+        return 1
+    fi
+
+    if [ ! -s "$ssh_dir/authorized_keys" ]; then
+        log_error "Downloaded keys file is empty"
+        return 1
+    fi
+
+    chmod 700 "$ssh_dir"
+    chmod 600 "$ssh_dir/authorized_keys"
+    chown -R "$username:$username" "$ssh_dir"
+
+    log_info "SSH keys imported for $username"
+}
 
 # Create additional users with their SSH keys
 create_additional_users() {
@@ -315,7 +520,7 @@ install_zsh() {
     local user_home="/home/$username"
 
     log_info "Installing zsh..."
-    apt-get install -y zsh git curl
+    $PKG_INSTALL zsh git curl
 
     # Check if oh-my-zsh is already installed
     if [ -d "${user_home}/.oh-my-zsh" ]; then
@@ -377,7 +582,7 @@ install_direnv() {
     local user_home="/home/$username"
 
     log_info "Installing direnv..."
-    apt-get install -y direnv
+    $PKG_INSTALL direnv
 
     # Add direnv hook to .zshrc
     log_info "Configuring direnv for zsh..."
@@ -389,8 +594,7 @@ install_direnv() {
 # Install mosh
 install_mosh() {
     log_info "Installing mosh..."
-
-    apt-get install -y mosh
+    $PKG_INSTALL mosh
 
     log_info "Mosh installed successfully"
 }
@@ -402,7 +606,7 @@ configure_ufw() {
     # Install ufw if not present
     if ! command -v ufw &>/dev/null; then
         log_info "Installing UFW..."
-        apt-get install -y ufw
+        $PKG_INSTALL ufw
     fi
 
     # Detect SSH port from sshd_config
@@ -475,20 +679,20 @@ install_crowdsec() {
     
     # Update package lists to ensure the new repository is recognized
     log_info "Updating package lists..."
-    apt-get update -y
+    $PKG_UPDATE
 
     # Install CrowdSec
     log_info "Installing CrowdSec..."
-    apt-get install -y crowdsec
+    $PKG_INSTALL crowdsec
 
     # Install firewall bouncer
     log_info "Installing CrowdSec firewall bouncer..."
-    apt-get install -y crowdsec-firewall-bouncer-iptables
+    $PKG_INSTALL crowdsec-firewall-bouncer-iptables
 
     # Enable and start CrowdSec service
     log_info "Enabling CrowdSec service..."
-    systemctl enable crowdsec
-    systemctl start crowdsec
+    SERVICE_ENABLE crowdsec
+    SERVICE_START crowdsec
 
     # Wait for CrowdSec to initialize
     sleep 5
@@ -503,7 +707,7 @@ install_crowdsec() {
 
     # Reload CrowdSec to apply collections
     log_info "Reloading CrowdSec..."
-    systemctl reload crowdsec
+    SERVICE_RELOAD crowdsec
 
     # Show CrowdSec status
     log_info "CrowdSec installation completed. Status:"
@@ -571,7 +775,8 @@ EOF
 # Restart SSH service
 restart_ssh() {
     log_info "Restarting SSH service..."
-    systemctl restart sshd || systemctl restart ssh
+    # Use detected service manager, try common ssh service names.
+    SERVICE_RESTART sshd || SERVICE_RESTART ssh || log_warn "Failed to restart SSH service"
     log_info "SSH service restarted"
 }
 
