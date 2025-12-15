@@ -15,7 +15,7 @@
 # - Install and configure starship prompt
 # - Install and configure direnv
 # - Install mosh for better remote connections
-# - Configure UFW firewall (SSH, HTTP, HTTPS, Mosh)
+# - Configure UFW firewall (nftables backend)
 # - Install and configure CrowdSec for intrusion prevention
 # - Enable BBR if supported
 #############################################
@@ -25,6 +25,7 @@ set -e
 # Global variables
 ADDITIONAL_USERS=""
 ADD_ADDITIONAL_USERS=false
+FIREWALL="ufw" # supported: ufw, nftables
 
 # Colors for output
 RED='\033[0;31m'
@@ -132,12 +133,22 @@ parse_arguments() {
                 ADD_ADDITIONAL_USERS=true
                 shift 2
                 ;;
+            --firewall)
+                FIREWALL="${2:-}"
+                if [ "$FIREWALL" != "nftables" ] && [ "$FIREWALL" != "ufw" ]; then
+                    log_error "Invalid firewall: $FIREWALL (expected: nftables or ufw)"
+                    exit 1
+                fi
+                shift 2
+                ;;
             -h|--help)
                 echo "Usage: $0 [OPTIONS]"
                 echo ""
                 echo "Options:"
                 echo "  -a, --add-users         Enable adding additional users (will prompt for details)"
                 echo "  -u, --users USERS       Specify additional users (semicolon-separated)"
+                echo "      --firewall FW       Firewall implementation (default: nftables)"
+                echo "                          FW: nftables | ufw"
                 echo "                          Format: username@key_url[:sudo|:nopasswd]"
                 echo "                          :sudo     - Sudo access (password required)"
                 echo "                          :nopasswd - Sudo access (passwordless)"
@@ -599,6 +610,133 @@ install_mosh() {
     log_info "Mosh installed successfully"
 }
 
+ensure_iptables_nft_backend() {
+    # UFW uses iptables tooling; we prefer iptables-nft so rules are managed by nftables backend.
+    if ! command -v update-alternatives &>/dev/null; then
+        log_warn "update-alternatives not found; cannot force iptables-nft backend"
+        return 0
+    fi
+
+    local changed=false
+    local alt_name alt_target
+
+    for alt_name in iptables ip6tables arptables ebtables; do
+        alt_target="${alt_name}-nft"
+        if command -v "$alt_target" &>/dev/null; then
+            if update-alternatives --set "$alt_name" "$(command -v "$alt_target")" >/dev/null 2>&1; then
+                changed=true
+            else
+                log_warn "Failed to set $alt_name alternative to $alt_target"
+            fi
+        else
+            log_warn "$alt_target not found; cannot set $alt_name to nft backend"
+        fi
+    done
+
+    if command -v iptables &>/dev/null; then
+        local iptables_ver
+        iptables_ver="$(iptables -V 2>/dev/null || true)"
+        if echo "$iptables_ver" | grep -qi "nf_tables"; then
+            log_info "iptables backend: nf_tables"
+        else
+            log_warn "iptables may not be using nf_tables backend: ${iptables_ver:-unknown}"
+        fi
+    fi
+
+    if [ "$changed" = true ]; then
+        log_info "Configured iptables alternatives to use nft backend (where available)"
+    fi
+}
+
+# Configure nftables firewall (default)
+configure_nftables() {
+    log_info "Configuring nftables firewall..."
+
+    if ! command -v nft &>/dev/null; then
+        log_info "Installing nftables..."
+        $PKG_INSTALL nftables
+    fi
+
+    # Detect SSH port from sshd_config
+    local ssh_port
+    ssh_port=$(grep -E "^Port " /etc/ssh/sshd_config | awk '{print $2}' | head -n1)
+    if [ -z "$ssh_port" ]; then
+        ssh_port=22
+    fi
+
+    log_info "Detected SSH port: $ssh_port"
+
+    # Disable ufw if active to avoid conflicting rulesets.
+    if command -v ufw &>/dev/null; then
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            log_warn "UFW is active; disabling it because firewall backend is nftables"
+            ufw --force disable || log_warn "Failed to disable UFW"
+        fi
+    fi
+
+    local nft_conf="/etc/nftables.conf"
+    local managed_marker="Managed by server-init.sh"
+
+    if [ -r "$nft_conf" ] && grep -q "$managed_marker" "$nft_conf"; then
+        log_info "Existing nftables config managed by this script; updating rules"
+    else
+        if nft list ruleset 2>/dev/null | grep -q .; then
+            log_info "nftables already has rules; preserving existing ruleset"
+            log_warn "Skipping nftables rule changes; ensure SSH ($ssh_port/tcp) and Mosh (60000-61000/udp) are allowed"
+            SERVICE_ENABLE nftables
+            SERVICE_START nftables || true
+            return
+        fi
+    fi
+
+    if [ -e "$nft_conf" ]; then
+        cp "$nft_conf" "${nft_conf}.backup.$(date +%Y%m%d_%H%M%S)"
+    fi
+
+    cat > "$nft_conf" <<EOF
+#!/usr/sbin/nft -f
+# ${managed_marker}
+
+flush ruleset
+
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+
+    iif lo accept
+    ct state established,related accept
+
+    ip protocol icmp accept
+    ip6 nexthdr icmpv6 accept
+
+    tcp dport ${ssh_port} accept comment "SSH"
+    udp dport 60000-61000 accept comment "Mosh"
+
+    # Uncomment if you want to host web services:
+    # tcp dport 80 accept comment "HTTP"
+    # tcp dport 443 accept comment "HTTPS"
+  }
+
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+  }
+
+  chain output {
+    type filter hook output priority 0; policy accept;
+  }
+}
+EOF
+
+    # Enable and apply
+    SERVICE_ENABLE nftables
+    SERVICE_START nftables || true
+    SERVICE_RELOAD nftables || true
+
+    log_info "nftables configuration completed. Current ruleset:"
+    nft list ruleset || log_warn "Failed to list nftables ruleset"
+    log_warn "Firewall is active. Ensure port $ssh_port (SSH) is accessible."
+}
+
 # Configure UFW firewall
 configure_ufw() {
     log_info "Configuring UFW firewall..."
@@ -608,6 +746,9 @@ configure_ufw() {
         log_info "Installing UFW..."
         $PKG_INSTALL ufw
     fi
+
+    # Ensure UFW uses nftables backend via iptables-nft.
+    ensure_iptables_nft_backend
 
     # Detect SSH port from sshd_config
     local ssh_port=$(grep -E "^Port " /etc/ssh/sshd_config | awk '{print $2}')
@@ -663,6 +804,17 @@ configure_ufw() {
     log_warn "Firewall is active. Ensure port $ssh_port (SSH) is accessible."
 }
 
+configure_firewall() {
+    case "$FIREWALL" in
+        nftables) configure_nftables ;;
+        ufw) configure_ufw ;;
+        *)
+            log_warn "Unknown firewall '$FIREWALL', defaulting to nftables"
+            configure_nftables
+            ;;
+    esac
+}
+
 # Install and configure CrowdSec
 install_crowdsec() {
     log_info "Installing CrowdSec for intrusion prevention..."
@@ -687,7 +839,20 @@ install_crowdsec() {
 
     # Install firewall bouncer
     log_info "Installing CrowdSec firewall bouncer..."
-    $PKG_INSTALL crowdsec-firewall-bouncer-iptables
+    local bouncer_pkg="crowdsec-firewall-bouncer-nftables"
+    if [ "$FIREWALL" = "ufw" ]; then
+        bouncer_pkg="crowdsec-firewall-bouncer-iptables"
+    fi
+
+    if ! $PKG_INSTALL "$bouncer_pkg"; then
+        log_warn "Failed to install $bouncer_pkg"
+        if [ "$bouncer_pkg" != "crowdsec-firewall-bouncer-iptables" ]; then
+            log_warn "Falling back to crowdsec-firewall-bouncer-iptables"
+            $PKG_INSTALL crowdsec-firewall-bouncer-iptables
+        else
+            return 1
+        fi
+    fi
 
     # Enable and start CrowdSec service
     log_info "Enabling CrowdSec service..."
@@ -802,7 +967,7 @@ main() {
     install_zsh
     install_direnv
     install_mosh
-    configure_ufw
+    configure_firewall
     install_crowdsec
     enable_bbr
     restart_ssh
@@ -824,7 +989,7 @@ main() {
     log_info "Starship prompt has been configured with plain-text-symbols preset"
     log_info "Direnv has been installed and configured"
     log_info "Mosh has been installed for better remote connections"
-    log_info "UFW firewall has been configured and enabled"
+    log_info "Firewall has been configured and enabled ($FIREWALL)"
     log_info "CrowdSec has been installed for intrusion prevention"
     log_info "BBR has been checked and enabled if supported"
     log_info ""
