@@ -23,13 +23,12 @@
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 # Global variables
 ADDITIONAL_USERS=""
 ADD_ADDITIONAL_USERS=false
 FIREWALL="ufw" # supported: ufw, nftables
 DAE_SUBSCRIPTION_URL=""
+DAE_CONFIG_TEMPLATE_URL="https://raw.githubusercontent.com/arcat0v0/personal-server-script/main/config-template.dae"
 
 # CN network handling (override via env if needed).
 # CN_HTTP_PROXY example: http://127.0.0.1:7890
@@ -190,13 +189,15 @@ install_dae() {
 }
 
 configure_dae() {
-    local config_src="${SCRIPT_DIR}/config-template.dae"
+    local config_src="/tmp/dae-config-template.dae"
     local config_dir="/usr/local/etc/dae"
     local config_path="${config_dir}/config.dae"
     local escaped_sub=""
+    local template_url=""
 
-    if [ ! -f "$config_src" ]; then
-        log_error "Missing dae config template: $config_src"
+    template_url="$(proxy_url "$DAE_CONFIG_TEMPLATE_URL")"
+    if ! curl -fsSL "$template_url" -o "$config_src"; then
+        log_error "Failed to download dae config template from $template_url"
         return 1
     fi
 
