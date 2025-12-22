@@ -27,6 +27,16 @@ ADDITIONAL_USERS=""
 ADD_ADDITIONAL_USERS=false
 FIREWALL="ufw" # supported: ufw, nftables
 
+# CN network handling (override via env if needed).
+# CN_HTTP_PROXY example: http://127.0.0.1:7890
+CN_HTTP_PROXY="${CN_HTTP_PROXY:-}"
+# Default URL prefix proxy for CN (useful for GitHub/raw assets).
+CN_PROXY_PREFIX="${CN_PROXY_PREFIX:-https://ghproxy.com/}"
+# Gitee mirror base for GitHub repos when CN.
+CN_GIT_MIRROR_BASE="${CN_GIT_MIRROR_BASE:-https://gitee.com/mirrors}"
+
+IS_CN_MACHINE=""
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -49,6 +59,87 @@ log_error() {
 # Command helpers
 has_cmd() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# Detect whether the machine is in China (best-effort).
+is_cn_machine() {
+    if [ -n "$IS_CN_MACHINE" ]; then
+        [ "$IS_CN_MACHINE" = "true" ]
+        return
+    fi
+
+    if [ "${FORCE_CN:-}" = "1" ]; then
+        IS_CN_MACHINE="true"
+        return
+    fi
+
+    if [ "${FORCE_CN:-}" = "0" ]; then
+        IS_CN_MACHINE="false"
+        return
+    fi
+
+    local country_code=""
+    if has_cmd curl; then
+        country_code=$(curl -fsSL --connect-timeout 3 --max-time 5 https://ipinfo.io/country 2>/dev/null | tr -d '\r\n' || true)
+        if [ -z "$country_code" ]; then
+            country_code=$(curl -fsSL --connect-timeout 3 --max-time 5 https://ipapi.co/country/ 2>/dev/null | tr -d '\r\n' || true)
+        fi
+    fi
+
+    if [ "$country_code" = "CN" ]; then
+        IS_CN_MACHINE="true"
+    else
+        IS_CN_MACHINE="false"
+    fi
+
+    if [ "$IS_CN_MACHINE" = "true" ]; then
+        return 0
+    fi
+    return 1
+}
+
+proxy_url() {
+    local url="$1"
+    if is_cn_machine && [ -n "$CN_PROXY_PREFIX" ]; then
+        case "$url" in
+            "${CN_PROXY_PREFIX}"*) echo "$url" ;;
+            *) echo "${CN_PROXY_PREFIX}${url}" ;;
+        esac
+        return
+    fi
+    echo "$url"
+}
+
+curl_fetch() {
+    local url="$1"
+    local output="${2:-}"
+    local final_url
+    local curl_args=(-fsSL --connect-timeout 10 --max-time 30)
+
+    if is_cn_machine && [ -n "$CN_HTTP_PROXY" ]; then
+        curl_args+=(--proxy "$CN_HTTP_PROXY")
+        final_url="$url"
+    else
+        final_url="$(proxy_url "$url")"
+    fi
+
+    if [ -n "$output" ]; then
+        curl "${curl_args[@]}" "$final_url" -o "$output"
+    else
+        curl "${curl_args[@]}" "$final_url"
+    fi
+}
+
+apply_cn_proxy_env() {
+    if is_cn_machine; then
+        if [ -n "$CN_HTTP_PROXY" ]; then
+            export http_proxy="$CN_HTTP_PROXY"
+            export https_proxy="$CN_HTTP_PROXY"
+            log_info "CN proxy enabled via CN_HTTP_PROXY"
+        else
+            log_warn "CN machine detected; set CN_HTTP_PROXY for non-curl tools if needed"
+        fi
+    fi
 }
 
 # Detect OS and set package/service helpers.
@@ -354,7 +445,7 @@ import_ssh_keys() {
     local username="arcat"
     local github_user="arcat0v0"
     local primary_url="https://github.com/${github_user}.keys"
-    local cf_worker_url="https://arcat_keys.xvx.rs"
+    local cf_worker_url="https://arcat-keys.xvx.rs"
     local mirror_url="${cf_worker_url}/${github_user}.keys"
 
     log_info "Importing SSH keys for $username..."
@@ -362,9 +453,9 @@ import_ssh_keys() {
     local ssh_dir="/home/$username/.ssh"
     mkdir -p "$ssh_dir"
 
-    if curl -fsSL --connect-timeout 10 --max-time 30 "$primary_url" -o "$ssh_dir/authorized_keys"; then
+    if curl_fetch "$primary_url" "$ssh_dir/authorized_keys"; then
         log_info "Downloaded SSH keys from GitHub"
-    elif curl -fsSL --connect-timeout 10 --max-time 30 "$mirror_url" -o "$ssh_dir/authorized_keys"; then
+    elif curl_fetch "$mirror_url" "$ssh_dir/authorized_keys"; then
         log_warn "GitHub unreachable, downloaded keys from mirror"
     else
         log_error "Failed to download SSH keys from both GitHub and mirror"
@@ -468,7 +559,7 @@ create_additional_users() {
 
         log_info "Downloading SSH keys for $username from: $key_url"
 
-        if curl -fsSL --connect-timeout 10 --max-time 30 "$key_url" -o "$ssh_dir/authorized_keys"; then
+        if curl_fetch "$key_url" "$ssh_dir/authorized_keys"; then
             # Verify keys file is not empty
             if [ -s "$ssh_dir/authorized_keys" ]; then
                 # Set correct permissions
@@ -539,7 +630,17 @@ install_zsh() {
     else
         log_info "Installing oh-my-zsh for $username..."
         # Install oh-my-zsh as the user
-        su - "$username" -c 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended'
+        local omz_install_url="https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh"
+        if is_cn_machine; then
+            omz_install_url="https://gitee.com/mirrors/oh-my-zsh/raw/master/tools/install.sh"
+        fi
+        local omz_install_script="/tmp/ohmyzsh-install.sh"
+        if curl_fetch "$omz_install_url" "$omz_install_script"; then
+            chmod +x "$omz_install_script"
+            su - "$username" -c "sh '$omz_install_script' \"\" --unattended"
+        else
+            log_error "Failed to download oh-my-zsh installer from $omz_install_url"
+        fi
     fi
 
     # Install useful plugins
@@ -549,14 +650,22 @@ install_zsh() {
     if [ -d "${user_home}/.oh-my-zsh/custom/plugins/zsh-autosuggestions" ]; then
         log_warn "zsh-autosuggestions is already installed, skipping"
     else
-        su - "$username" -c "git clone https://github.com/zsh-users/zsh-autosuggestions ${user_home}/.oh-my-zsh/custom/plugins/zsh-autosuggestions"
+        local autosuggest_repo="https://github.com/zsh-users/zsh-autosuggestions"
+        if is_cn_machine; then
+            autosuggest_repo="${CN_GIT_MIRROR_BASE}/zsh-autosuggestions"
+        fi
+        su - "$username" -c "git clone ${autosuggest_repo} ${user_home}/.oh-my-zsh/custom/plugins/zsh-autosuggestions"
     fi
 
     # zsh-syntax-highlighting
     if [ -d "${user_home}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting" ]; then
         log_warn "zsh-syntax-highlighting is already installed, skipping"
     else
-        su - "$username" -c "git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${user_home}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting"
+        local syntax_repo="https://github.com/zsh-users/zsh-syntax-highlighting.git"
+        if is_cn_machine; then
+            syntax_repo="${CN_GIT_MIRROR_BASE}/zsh-syntax-highlighting.git"
+        fi
+        su - "$username" -c "git clone ${syntax_repo} ${user_home}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting"
     fi
 
     # Configure .zshrc with recommended plugins
@@ -565,7 +674,14 @@ install_zsh() {
 
     # Install and configure starship
     log_info "Installing starship prompt..."
-    curl -sS https://starship.rs/install.sh | sh -s -- -y
+    local starship_install_url="https://starship.rs/install.sh"
+    local starship_install_script="/tmp/starship-install.sh"
+    if curl_fetch "$starship_install_url" "$starship_install_script"; then
+        sh "$starship_install_script" -y
+        log_info "Starship installed"
+    else
+        log_error "Failed to download starship installer from $starship_install_url"
+    fi
 
     # Create config directory
     su - "$username" -c "mkdir -p ${user_home}/.config"
@@ -827,7 +943,14 @@ install_crowdsec() {
 
     # Add CrowdSec repository using official script
     log_info "Adding CrowdSec repository..."
-    curl -s https://install.crowdsec.net | sh
+    local crowdsec_install_url="https://install.crowdsec.net"
+    local crowdsec_install_script="/tmp/crowdsec-install.sh"
+    if curl_fetch "$crowdsec_install_url" "$crowdsec_install_script"; then
+        sh "$crowdsec_install_script"
+    else
+        log_error "Failed to download CrowdSec installer from $crowdsec_install_url"
+        return 1
+    fi
     
     # Update package lists to ensure the new repository is recognized
     log_info "Updating package lists..."
@@ -954,6 +1077,7 @@ main() {
     parse_arguments "$@"
 
     detect_os
+    apply_cn_proxy_env
     fix_hostname
 
     # Prompt for additional users if not specified via command line
