@@ -18,14 +18,18 @@
 # - Configure UFW firewall (nftables backend)
 # - Install and configure CrowdSec for intrusion prevention
 # - Enable BBR if supported
+# - CN mode: install dae after base tools and skip optional installers
 #############################################
 
 set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Global variables
 ADDITIONAL_USERS=""
 ADD_ADDITIONAL_USERS=false
 FIREWALL="ufw" # supported: ufw, nftables
+DAE_SUBSCRIPTION_URL=""
 
 # CN network handling (override via env if needed).
 # CN_HTTP_PROXY example: http://127.0.0.1:7890
@@ -164,6 +168,48 @@ report_cn_optimization() {
     fi
 }
 
+prompt_dae_subscription() {
+    if [ -n "$DAE_SUBSCRIPTION_URL" ]; then
+        return
+    fi
+
+    echo ""
+    log_info "CN mode detected: dae will be installed and configured"
+    read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Enter dae subscription URL (my_sub): )" -r < /dev/tty || return 1
+    if [ -z "$REPLY" ]; then
+        log_error "Subscription URL is required for dae configuration"
+        return 1
+    fi
+    DAE_SUBSCRIPTION_URL="$REPLY"
+}
+
+install_dae() {
+    log_info "Installing dae..."
+    sudo sh -c "$(wget -qO- https://cdn.jsdelivr.net/gh/daeuniverse/dae-installer/installer.sh)" @ install use-cdn
+    log_info "dae installed"
+}
+
+configure_dae() {
+    local config_src="${SCRIPT_DIR}/config-template.dae"
+    local config_dir="/usr/local/etc/dae"
+    local config_path="${config_dir}/config.dae"
+    local escaped_sub=""
+
+    if [ ! -f "$config_src" ]; then
+        log_error "Missing dae config template: $config_src"
+        return 1
+    fi
+
+    escaped_sub="${DAE_SUBSCRIPTION_URL//\\/\\\\}"
+    escaped_sub="${escaped_sub//&/\\&}"
+    escaped_sub="${escaped_sub//#/\\#}"
+
+    mkdir -p "$config_dir"
+    cp "$config_src" "$config_path"
+    sed -i "s#^\\(\\s*my_sub:\\s*\\).*\$#\\1'${escaped_sub}'#" "$config_path"
+    log_info "dae config written to $config_path"
+}
+
 # Detect OS and set package/service helpers.
 detect_os() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -246,6 +292,10 @@ parse_arguments() {
                 ADD_ADDITIONAL_USERS=true
                 shift 2
                 ;;
+            --dae-sub)
+                DAE_SUBSCRIPTION_URL="$2"
+                shift 2
+                ;;
             --cn)
                 FORCE_CN="1"
                 shift
@@ -264,6 +314,7 @@ parse_arguments() {
                 echo "Options:"
                 echo "  -a, --add-users         Enable adding additional users (will prompt for details)"
                 echo "  -u, --users USERS       Specify additional users (semicolon-separated)"
+                echo "      --dae-sub URL       Set dae subscription URL (my_sub)"
                 echo "      --cn                Force China optimized addresses"
                 echo "      --firewall FW       Firewall implementation (default: nftables)"
                 echo "                          FW: nftables | ufw"
@@ -276,6 +327,7 @@ parse_arguments() {
                 echo "  $0                                    # Run with interactive prompts"
                 echo "  $0 -a                                 # Enable additional users, will prompt for details"
                 echo "  $0 -u 'alice@url:nopasswd;bob@url:sudo;charlie@url'"
+                echo "  $0 --cn --dae-sub URL                 # CN mode with dae subscription URL"
                 echo "  $0 --cn                               # Force China optimized addresses"
                 exit 0
                 ;;
@@ -1110,16 +1162,27 @@ main() {
     prompt_additional_users
 
     update_system
+
+    if is_cn_machine; then
+        if ! prompt_dae_subscription; then
+            exit 1
+        fi
+        install_dae
+        configure_dae
+    fi
+
     create_user
     import_ssh_keys
     create_additional_users
     disable_root_login
-    install_zsh
-    install_direnv
-    install_mosh
-    configure_firewall
-    install_crowdsec
-    enable_bbr
+    if ! is_cn_machine; then
+        install_zsh
+        install_direnv
+        install_mosh
+        configure_firewall
+        install_crowdsec
+        enable_bbr
+    fi
     restart_ssh
 
     echo ""
@@ -1135,21 +1198,29 @@ main() {
 
     log_info "Hostname resolution has been configured"
     log_info "Root login has been disabled"
-    log_info "Zsh with oh-my-zsh has been installed"
-    log_info "Starship prompt has been configured with plain-text-symbols preset"
-    log_info "Direnv has been installed and configured"
-    log_info "Mosh has been installed for better remote connections"
-    log_info "Firewall has been configured and enabled ($FIREWALL)"
-    log_info "CrowdSec has been installed for intrusion prevention"
-    log_info "BBR has been checked and enabled if supported"
+    if is_cn_machine; then
+        log_info "dae has been installed and configured"
+        log_info "dae config location: /usr/local/etc/dae/config.dae"
+    else
+        log_info "Zsh with oh-my-zsh has been installed"
+        log_info "Starship prompt has been configured with plain-text-symbols preset"
+        log_info "Direnv has been installed and configured"
+        log_info "Mosh has been installed for better remote connections"
+        log_info "Firewall has been configured and enabled ($FIREWALL)"
+        log_info "CrowdSec has been installed for intrusion prevention"
+        log_info "BBR has been checked and enabled if supported"
+    fi
     log_info ""
     log_warn "IMPORTANT: Please test SSH login with user 'arcat' before closing this session!"
-    log_info "You can also connect using: mosh arcat@your-server-ip"
     log_info ""
-    log_info "CrowdSec commands:"
-    log_info "  - View alerts: sudo cscli alerts list"
-    log_info "  - View bans: sudo cscli decisions list"
-    log_info "  - View metrics: sudo cscli metrics"
+    if ! is_cn_machine; then
+        log_info "You can also connect using: mosh arcat@your-server-ip"
+        log_info ""
+        log_info "CrowdSec commands:"
+        log_info "  - View alerts: sudo cscli alerts list"
+        log_info "  - View bans: sudo cscli decisions list"
+        log_info "  - View metrics: sudo cscli metrics"
+    fi
     log_info "=========================================="
 }
 
