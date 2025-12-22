@@ -36,6 +36,7 @@ CN_PROXY_PREFIX="${CN_PROXY_PREFIX:-https://ghproxy.com/}"
 CN_GIT_MIRROR_BASE="${CN_GIT_MIRROR_BASE:-https://gitee.com/mirrors}"
 
 IS_CN_MACHINE=""
+FORCE_CN="${FORCE_CN:-}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -103,7 +104,12 @@ proxy_url() {
     if is_cn_machine && [ -n "$CN_PROXY_PREFIX" ]; then
         case "$url" in
             "${CN_PROXY_PREFIX}"*) echo "$url" ;;
-            *) echo "${CN_PROXY_PREFIX}${url}" ;;
+            https://github.com/*|https://raw.githubusercontent.com/*|https://gist.githubusercontent.com/*)
+                echo "${CN_PROXY_PREFIX}${url}"
+                ;;
+            *)
+                echo "$url"
+                ;;
         esac
         return
     fi
@@ -138,6 +144,22 @@ apply_cn_proxy_env() {
             log_info "CN proxy enabled via CN_HTTP_PROXY"
         else
             log_warn "CN machine detected; set CN_HTTP_PROXY for non-curl tools if needed"
+        fi
+    fi
+}
+
+report_cn_optimization() {
+    if is_cn_machine; then
+        if [ "${FORCE_CN:-}" = "1" ]; then
+            log_info "China optimized address: enabled (forced)"
+        else
+            log_info "China optimized address: enabled (CN network detected)"
+        fi
+    else
+        if [ "${FORCE_CN:-}" = "0" ]; then
+            log_info "China optimized address: disabled (forced)"
+        else
+            log_info "China optimized address: disabled"
         fi
     fi
 }
@@ -224,6 +246,10 @@ parse_arguments() {
                 ADD_ADDITIONAL_USERS=true
                 shift 2
                 ;;
+            --cn)
+                FORCE_CN="1"
+                shift
+                ;;
             --firewall)
                 FIREWALL="${2:-}"
                 if [ "$FIREWALL" != "nftables" ] && [ "$FIREWALL" != "ufw" ]; then
@@ -238,6 +264,7 @@ parse_arguments() {
                 echo "Options:"
                 echo "  -a, --add-users         Enable adding additional users (will prompt for details)"
                 echo "  -u, --users USERS       Specify additional users (semicolon-separated)"
+                echo "      --cn                Force China optimized addresses"
                 echo "      --firewall FW       Firewall implementation (default: nftables)"
                 echo "                          FW: nftables | ufw"
                 echo "                          Format: username@key_url[:sudo|:nopasswd]"
@@ -249,6 +276,7 @@ parse_arguments() {
                 echo "  $0                                    # Run with interactive prompts"
                 echo "  $0 -a                                 # Enable additional users, will prompt for details"
                 echo "  $0 -u 'alice@url:nopasswd;bob@url:sudo;charlie@url'"
+                echo "  $0 --cn                               # Force China optimized addresses"
                 exit 0
                 ;;
             *)
@@ -674,13 +702,10 @@ install_zsh() {
 
     # Install and configure starship
     log_info "Installing starship prompt..."
-    local starship_install_url="https://starship.rs/install.sh"
-    local starship_install_script="/tmp/starship-install.sh"
-    if curl_fetch "$starship_install_url" "$starship_install_script"; then
-        sh "$starship_install_script" -y
+    if $PKG_INSTALL starship; then
         log_info "Starship installed"
     else
-        log_error "Failed to download starship installer from $starship_install_url"
+        log_error "Failed to install starship via apt"
     fi
 
     # Create config directory
@@ -1079,6 +1104,7 @@ main() {
     detect_os
     apply_cn_proxy_env
     fix_hostname
+    report_cn_optimization
 
     # Prompt for additional users if not specified via command line
     prompt_additional_users
