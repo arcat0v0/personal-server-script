@@ -31,7 +31,7 @@ FIREWALL="ufw" # supported: ufw, nftables
 # CN_HTTP_PROXY example: http://127.0.0.1:7890
 CN_HTTP_PROXY="${CN_HTTP_PROXY:-}"
 # Default URL prefix proxy for CN (useful for GitHub/raw assets).
-CN_PROXY_PREFIX="${CN_PROXY_PREFIX:-https://ghproxy.com/}"
+CN_PROXY_PREFIX="${CN_PROXY_PREFIX:-https://ghfast.top/}"
 # Gitee mirror base for GitHub repos when CN.
 CN_GIT_MIRROR_BASE="${CN_GIT_MIRROR_BASE:-https://gitee.com/mirrors}"
 
