@@ -174,7 +174,7 @@ prompt_dae_subscription() {
 
     echo ""
     log_info "CN mode detected: dae will be installed and configured"
-    read -p "$(echo -e ${YELLOW}[PROMPT]${NC} Enter dae subscription URL (my_sub): )" -r < /dev/tty || return 1
+    read -p "$(printf "%b" "${YELLOW}[PROMPT]${NC} Enter dae subscription URL (my_sub): ")" -r < /dev/tty || return 1
     if [ -z "$REPLY" ]; then
         log_error "Subscription URL is required for dae configuration"
         return 1
