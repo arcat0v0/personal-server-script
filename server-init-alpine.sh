@@ -56,6 +56,10 @@ has_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
+can_prompt() {
+    test -t 0
+}
+
 is_cn_machine() {
     if [ -n "$IS_CN_MACHINE" ]; then
         [ "$IS_CN_MACHINE" = "true" ]
@@ -160,6 +164,11 @@ report_cn_optimization() {
 prompt_dae_subscription() {
     if [ -n "$DAE_SUBSCRIPTION_URL" ]; then
         return
+    fi
+
+    if ! can_prompt; then
+        log_error "No TTY available. Use --dae-sub URL to provide the subscription URL."
+        return 1
     fi
 
     echo ""
@@ -304,6 +313,9 @@ parse_arguments() {
 
 prompt_additional_users() {
     if [ "$ADD_ADDITIONAL_USERS" = false ]; then
+        if ! can_prompt; then
+            return 0
+        fi
         echo ""
         printf "%b" "${YELLOW}[PROMPT]${NC} Do you want to create additional users? (y/N): " > /dev/tty
         if ! read -r REPLY < /dev/tty; then
