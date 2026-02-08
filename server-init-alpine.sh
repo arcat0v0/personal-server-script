@@ -494,6 +494,7 @@ create_user() {
         log_warn "User $username already exists, skipping creation"
     else
         adduser -D -s /bin/sh "$username"
+        sed -i "s/^${username}:!:/${username}:*:/" /etc/shadow
         log_info "User $username created"
     fi
 
@@ -531,6 +532,8 @@ import_ssh_keys() {
         return 1
     fi
 
+    chown "$username:$username" "/home/$username"
+    chmod 755 "/home/$username"
     chmod 700 "$ssh_dir"
     chmod 600 "$ssh_dir/authorized_keys"
     chown -R "$username:$username" "$ssh_dir"
@@ -588,6 +591,7 @@ create_additional_users() {
             log_info "Updating SSH keys for existing user: $username"
         else
             if adduser -D -s /bin/sh "$username"; then
+                sed -i "s/^${username}:!:/${username}:*:/" /etc/shadow
                 log_info "User $username created"
             else
                 log_error "Failed to create user: $username"
@@ -619,6 +623,8 @@ create_additional_users() {
 
         if curl_fetch "$key_url" "$ssh_dir/authorized_keys"; then
             if [ -s "$ssh_dir/authorized_keys" ]; then
+                chown "$username:$username" "/home/$username"
+                chmod 755 "/home/$username"
                 chmod 700 "$ssh_dir"
                 chmod 600 "$ssh_dir/authorized_keys"
                 chown -R "$username:$username" "$ssh_dir"
@@ -780,62 +786,19 @@ configure_nftables() {
 
     log_info "Detected SSH port: $ssh_port"
 
-    local nft_conf="/etc/nftables.conf"
-    local managed_marker="Managed by server-init-alpine.sh"
+    mkdir -p /etc/nftables.d
 
-    if [ -r "$nft_conf" ] && grep -q "$managed_marker" "$nft_conf"; then
-        log_info "Existing nftables config managed by this script; updating rules"
-    else
-        if nft list ruleset 2>/dev/null | grep -q .; then
-            log_info "nftables already has rules; preserving existing ruleset"
-            log_warn "Skipping nftables rule changes; ensure SSH ($ssh_port/tcp) and Mosh (60000-61000/udp) are allowed"
-            SERVICE_ENABLE nftables
-            SERVICE_START nftables || true
-            return
-        fi
-    fi
-
-    if [ -e "$nft_conf" ]; then
-        cp "$nft_conf" "${nft_conf}.backup.$(date +%Y%m%d_%H%M%S)"
-    fi
-
-    cat > "$nft_conf" <<EOF
-#!/usr/sbin/nft -f
-# ${managed_marker}
-
-flush ruleset
-
+    cat > /etc/nftables.d/server-init.nft <<EOF
 table inet filter {
   chain input {
-    type filter hook input priority 0; policy drop;
-
-    iif lo accept
-    ct state established,related accept
-
-    ip protocol icmp accept
-    ip6 nexthdr icmpv6 accept
-
-    tcp dport ${ssh_port} accept comment "SSH"
+    tcp dport $ssh_port accept comment "SSH"
     udp dport 60000-61000 accept comment "Mosh"
-
-    # Uncomment if you want to host web services:
-    # tcp dport 80 accept comment "HTTP"
-    # tcp dport 443 accept comment "HTTPS"
-  }
-
-  chain forward {
-    type filter hook forward priority 0; policy drop;
-  }
-
-  chain output {
-    type filter hook output priority 0; policy accept;
   }
 }
 EOF
 
     SERVICE_ENABLE nftables
-    SERVICE_START nftables || true
-    SERVICE_RELOAD nftables || true
+    SERVICE_RESTART nftables || true
 
     log_info "nftables configuration completed. Current ruleset:"
     nft list ruleset || log_warn "Failed to list nftables ruleset"
@@ -876,6 +839,7 @@ install_crowdsec() {
     rc-service cs-firewall-bouncer start
 
     log_info "Ensuring SSH protection collection is installed..."
+    cscli hub update || log_warn "Failed to update CrowdSec hub index"
     cscli collections install crowdsecurity/sshd || log_warn "SSH collection may already be installed"
 
     log_info "Installing Linux base collection..."
