@@ -1,10 +1,10 @@
 # Server Initialization Script
 
-一个用于快速初始化 Debian/Ubuntu 服务器的自动化脚本，帮助你在几分钟内完成服务器的基础配置。
+一个用于快速初始化服务器的自动化脚本，帮助你在几分钟内完成服务器的基础配置。
 
 ## 功能特性
 
-- ✅ **系统支持** - 支持 Debian 和 Ubuntu 系统
+- ✅ **系统支持** - 支持 Debian、Ubuntu 和 Alpine Linux 系统
 - 🔧 **系统配置** - 自动修复 hostname 解析问题
 - 🔒 **安全加固** - 禁用 root 登录，强制使用 SSH 密钥认证
 - 🛡️ **防火墙配置** - 自动配置 UFW 防火墙，只开放必要端口
@@ -24,14 +24,16 @@
 
 ### 一键安装
 
+**Debian / Ubuntu：**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/arcat0v0/personal-server-script/main/server-init.sh | sudo bash
 ```
 
-或使用 wget：
+**Alpine Linux：**
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/arcat0v0/personal-server-script/main/server-init.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/arcat0v0/personal-server-script/main/server-init-alpine.sh | sudo sh
 ```
 
 ### 手动安装
@@ -82,7 +84,9 @@ sudo ./server-init.sh -u 'alice@https://github.com/alice.keys:nopasswd;bob@https
 
 ### 系统要求
 
-- 操作系统：Debian 或 Ubuntu
+- 操作系统：Debian、Ubuntu 或 Alpine Linux
+  - Debian/Ubuntu：使用 `server-init.sh`
+  - Alpine：使用 `server-init-alpine.sh`
 - 权限：需要 root 权限
 - 网络：需要互联网连接
 - 内核：建议 4.9+ 以支持 BBR
