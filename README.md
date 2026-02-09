@@ -241,6 +241,82 @@ local cf_worker_url="https://arcat-keys.xvx.rs"
    - GitHub 直连 ⇄ Cloudflare Worker 代理
    - 任一方式失败会自动切换到另一方式
 
+## ECS 抢占式实例保活脚本
+
+`aliyun-ecs-keepalive.py` 用于阿里云 ECS 抢占式实例的保活与流量监控。通过 CDT API 查询当前月流量，低于阈值则启动实例，超过阈值则停止实例，适合通过 crontab 定时调用。
+
+### 依赖安装
+
+推荐使用 [uv](https://github.com/astral-sh/uv) 初始化虚拟环境并安装依赖：
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install aliyun-python-sdk-core aliyun-python-sdk-ecs
+```
+
+也可以使用 pip：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install aliyun-python-sdk-core aliyun-python-sdk-ecs
+```
+
+### 环境变量配置
+
+| 环境变量 | 说明 | 默认值 |
+|---|---|---|
+| `ALIYUN_ACCESS_KEY_ID` | AccessKey ID | 必填 |
+| `ALIYUN_ACCESS_KEY_SECRET` | AccessKey Secret | 必填 |
+| `ALIYUN_REGION_ID` | 区域 ID | `cn-hongkong` |
+| `ALIYUN_ECS_INSTANCE_ID` | ECS 实例 ID | 必填 |
+| `TRAFFIC_THRESHOLD_GB` | 流量阈值 (GB) | `180` |
+
+### 命令行参数
+
+```bash
+# 查看帮助
+python aliyun-ecs-keepalive.py --help
+
+# 自动模式：根据流量自动启停实例
+python aliyun-ecs-keepalive.py
+
+# 仅查询流量和实例状态，不执行操作
+python aliyun-ecs-keepalive.py --check
+
+# 强制启动实例（忽略流量判断）
+python aliyun-ecs-keepalive.py --start
+
+# 强制停止实例（忽略流量判断）
+python aliyun-ecs-keepalive.py --stop
+
+# 通过命令行参数覆盖环境变量
+python aliyun-ecs-keepalive.py --access-key-id YOUR_KEY --access-key-secret YOUR_SECRET --instance-id i-xxx
+```
+
+### Crontab 配置示例
+
+```bash
+# 编辑 crontab
+crontab -e
+
+# 每 5 分钟检查一次，自动启停实例
+*/5 * * * * ALIYUN_ACCESS_KEY_ID=xxx ALIYUN_ACCESS_KEY_SECRET=xxx ALIYUN_ECS_INSTANCE_ID=i-xxx /usr/bin/python3 /path/to/aliyun-ecs-keepalive.py >> /var/log/ecs-keepalive.log 2>&1
+```
+
+也可以将环境变量写入文件，配合 `env` 使用：
+
+```bash
+# /etc/ecs-keepalive.env
+ALIYUN_ACCESS_KEY_ID=xxx
+ALIYUN_ACCESS_KEY_SECRET=xxx
+ALIYUN_ECS_INSTANCE_ID=i-xxx
+
+# crontab 中引用
+*/5 * * * * env $(cat /etc/ecs-keepalive.env | xargs) /usr/bin/python3 /path/to/aliyun-ecs-keepalive.py >> /var/log/ecs-keepalive.log 2>&1
+```
+
 ## 自定义配置
 
 如果你需要修改默认配置，可以编辑脚本中的以下部分：
