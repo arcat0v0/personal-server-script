@@ -79,7 +79,7 @@ is_cn_machine() {
 
     if [ "${FORCE_CN:-}" = "0" ]; then
         IS_CN_MACHINE="false"
-        return
+        return 1
     fi
 
     local country_code=""

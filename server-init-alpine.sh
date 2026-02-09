@@ -73,7 +73,7 @@ is_cn_machine() {
 
     if [ "${FORCE_CN:-}" = "0" ]; then
         IS_CN_MACHINE="false"
-        return
+        return 1
     fi
 
     local country_code=""
@@ -406,6 +406,13 @@ prompt_additional_users() {
     fi
 }
 
+sed_inplace() {
+    local expr="$1" file="$2" tmp
+    tmp=$(mktemp)
+    sed "$expr" "$file" > "$tmp" && cat "$tmp" > "$file"
+    rm -f "$tmp"
+}
+
 fix_hostname() {
     log_info "Fixing hostname resolution..."
 
@@ -418,11 +425,11 @@ fix_hostname() {
     fi
 
     local hosts_file="/etc/hosts"
-    cp "$hosts_file" "${hosts_file}.backup.$(date +%Y%m%d_%H%M%S)"
+    cp "$hosts_file" "${hosts_file}.backup.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
 
     if grep -qE "^127\.0\.0\.1[[:space:]]+" "$hosts_file"; then
         if ! grep -qE "^127\.0\.0\.1[[:space:]].*\blocalhost\b" "$hosts_file"; then
-            sed -i "s/^127\.0\.0\.1[[:space:]]\+\(.*\)$/127.0.0.1\tlocalhost \1/" "$hosts_file"
+            sed_inplace "s/^127\.0\.0\.1[[:space:]]\+\(.*\)$/127.0.0.1\tlocalhost \1/" "$hosts_file"
         fi
     else
         printf "127.0.0.1\tlocalhost\n" >> "$hosts_file"
@@ -434,7 +441,7 @@ fix_hostname() {
     fi
 
     if grep -qE "^127\.0\.0\.1[[:space:]]+" "$hosts_file"; then
-        sed -i "s/^127\.0\.0\.1[[:space:]]\+\(.*\)$/127.0.0.1\t\1 ${hostname}/" "$hosts_file"
+        sed_inplace "s/^127\.0\.0\.1[[:space:]]\+\(.*\)$/127.0.0.1\t\1 ${hostname}/" "$hosts_file"
     else
         printf "127.0.0.1\tlocalhost ${hostname}\n" >> "$hosts_file"
     fi
@@ -770,6 +777,62 @@ install_mosh() {
     log_info "Mosh installed successfully"
 }
 
+sanitize_crowdsec_online_credentials() {
+    local capi_credentials="/etc/crowdsec/online_api_credentials.yaml"
+    local capi_url="https://api.crowdsec.net/"
+
+    if [ -f "$capi_credentials" ]; then
+        local detected_url=""
+        detected_url=$(awk '/^[[:space:]]*url:[[:space:]]*[^[:space:]]+/ {print $2; exit}' "$capi_credentials" 2>/dev/null || true)
+        if [ -n "$detected_url" ]; then
+            capi_url="$detected_url"
+        fi
+    fi
+
+    if [ -f "$capi_credentials" ] \
+        && grep -qE '^[[:space:]]*login:[[:space:]]*[^[:space:]]+' "$capi_credentials" \
+        && grep -qE '^[[:space:]]*password:[[:space:]]*[^[:space:]]+' "$capi_credentials"; then
+        return
+    fi
+
+    if [ -f "$capi_credentials" ]; then
+        local backup_path="${capi_credentials}.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$capi_credentials" "$backup_path"
+        log_warn "Invalid CrowdSec online_api_credentials.yaml; backup saved to $backup_path"
+    fi
+
+    cat > "$capi_credentials" <<EOF
+url: $capi_url
+EOF
+
+    log_info "Wrote minimal CrowdSec online API credentials (CAPI disabled)"
+}
+
+ensure_crowdsec_acquisition_datasource() {
+    local acquis_file="/etc/crowdsec/acquis.yaml"
+
+    if [ -f "$acquis_file" ] && grep -qE '^[[:space:]]*(source|journalctl_filter|filenames)[[:space:]]*:' "$acquis_file"; then
+        return
+    fi
+
+    if [ -f "$acquis_file" ]; then
+        local backup_path="${acquis_file}.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$acquis_file" "$backup_path"
+        log_warn "CrowdSec acquisition config had no datasource; backup saved to $backup_path"
+    fi
+
+    cat > "$acquis_file" <<'EOF'
+filenames:
+  - /var/log/auth.log
+  - /var/log/secure
+  - /var/log/messages
+labels:
+  type: syslog
+EOF
+
+    log_info "Configured default CrowdSec acquisition datasource in $acquis_file"
+}
+
 configure_nftables() {
     log_info "Configuring nftables firewall..."
 
@@ -805,6 +868,55 @@ EOF
     log_warn "Firewall is active. Ensure port $ssh_port (SSH) is accessible."
 }
 
+wait_for_crowdsec_lapi() {
+    local max_attempts=15
+    local attempt=0
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        if curl -sf http://127.0.0.1:8080/health >/dev/null 2>&1; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 2
+    done
+    log_warn "CrowdSec LAPI did not become ready after $((max_attempts * 2))s"
+    return 1
+}
+
+configure_crowdsec_bouncer() {
+    local bouncer_config="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
+
+    if [ ! -f "$bouncer_config" ]; then
+        log_warn "Bouncer config not found at $bouncer_config"
+        return 1
+    fi
+
+    log_info "Setting bouncer mode to nftables..."
+    sed_inplace "s/^mode: .*$/mode: nftables/" "$bouncer_config"
+
+    local existing_key
+    existing_key=$(awk '/^api_key:/ {print $2}' "$bouncer_config" | tr -d '[:space:]')
+    if [ -n "$existing_key" ]; then
+        log_info "Bouncer already has an API key, skipping registration"
+        return 0
+    fi
+
+    log_info "Registering firewall bouncer with CrowdSec LAPI..."
+    local bouncer_key
+    bouncer_key=$(cscli bouncers add cs-firewall-bouncer -o raw 2>/dev/null || true)
+
+    if [ -z "$bouncer_key" ]; then
+        bouncer_key=$(cscli bouncers add cs-firewall-bouncer --force -o raw 2>/dev/null || true)
+    fi
+
+    if [ -z "$bouncer_key" ]; then
+        log_error "Failed to generate bouncer API key"
+        return 1
+    fi
+
+    sed_inplace "s|^api_key:.*$|api_key: ${bouncer_key}|" "$bouncer_config"
+    log_info "Bouncer API key configured"
+}
+
 install_crowdsec() {
     log_info "Installing CrowdSec for intrusion prevention..."
 
@@ -826,30 +938,47 @@ install_crowdsec() {
     $PKG_INSTALL crowdsec crowdsec-openrc
 
     log_info "Installing CrowdSec firewall bouncer..."
-    $PKG_INSTALL cs-firewall-bouncer cs-firewall-bouncer-openrc
+    $PKG_INSTALL cs-firewall-bouncer cs-firewall-bouncer-openrc ipset
 
-    log_info "Enabling CrowdSec service..."
-    rc-update add crowdsec default >/dev/null 2>&1 || true
-    rc-service crowdsec start
+    sanitize_crowdsec_online_credentials
+    ensure_crowdsec_acquisition_datasource
 
-    sleep 5
+    # Ensure log files exist before CrowdSec starts, otherwise the file
+    # acquisition module silently skips missing paths and never re-checks.
+    touch /var/log/messages /var/log/auth.log /var/log/secure 2>/dev/null || true
 
-    log_info "Enabling CrowdSec firewall bouncer..."
-    rc-update add cs-firewall-bouncer default >/dev/null 2>&1 || true
-    rc-service cs-firewall-bouncer start
+    log_info "Downloading CrowdSec hub index..."
+    cscli hub update || log_warn "Failed to update CrowdSec hub index"
+
+    log_info "Registering CrowdSec local machine..."
+    cscli machines add -a --force
+
+    log_info "Enabling and starting CrowdSec service..."
+    SERVICE_ENABLE crowdsec
+    SERVICE_START crowdsec
+
+    log_info "Waiting for CrowdSec LAPI to become ready..."
+    wait_for_crowdsec_lapi
 
     log_info "Ensuring SSH protection collection is installed..."
-    cscli hub update || log_warn "Failed to update CrowdSec hub index"
     cscli collections install crowdsecurity/sshd || log_warn "SSH collection may already be installed"
 
     log_info "Installing Linux base collection..."
     cscli collections install crowdsecurity/linux || log_warn "Linux collection may already be installed"
 
-    log_info "Reloading CrowdSec..."
+    log_info "Reloading CrowdSec with new collections..."
     SERVICE_RELOAD crowdsec
+    sleep 3
+    wait_for_crowdsec_lapi
+
+    configure_crowdsec_bouncer
+
+    log_info "Starting CrowdSec firewall bouncer..."
+    SERVICE_ENABLE cs-firewall-bouncer
+    SERVICE_START cs-firewall-bouncer
 
     log_info "CrowdSec installation completed. Status:"
-    cscli metrics
+    cscli metrics || log_warn "Failed to query CrowdSec metrics"
 
     log_info "CrowdSec is now protecting your server against SSH brute-force and other attacks"
     log_info "You can view alerts with: sudo cscli alerts list"
@@ -903,7 +1032,7 @@ EOF
 
 restart_ssh() {
     log_info "Restarting SSH service..."
-    rc-service sshd restart || log_warn "Failed to restart SSH service"
+    SERVICE_RESTART sshd || log_warn "Failed to restart SSH service"
     log_info "SSH service restarted"
 }
 
