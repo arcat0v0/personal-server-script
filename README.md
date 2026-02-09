@@ -247,12 +247,10 @@ local cf_worker_url="https://arcat-keys.xvx.rs"
 
 ### 依赖安装
 
-推荐使用 [uv](https://github.com/astral-sh/uv) 初始化虚拟环境并安装依赖：
+推荐使用 [uv](https://github.com/astral-sh/uv) 安装依赖：
 
 ```bash
-uv venv
-source .venv/bin/activate
-uv pip install aliyun-python-sdk-core aliyun-python-sdk-ecs
+uv sync
 ```
 
 也可以使用 pip：
