@@ -187,8 +187,13 @@ render_rules() {
 
     : > "${STATE_FILE}"
 
+    if nft list table ip "${TABLE_NAME}" >/dev/null 2>&1; then
+        echo "delete table ip ${TABLE_NAME}" > "${RULES_FILE}"
+    else
+        : > "${RULES_FILE}"
+    fi
+
     {
-        echo "flush table ip ${TABLE_NAME}"
         echo "table ip ${TABLE_NAME} {"
         echo "  chain prerouting {"
         echo "    type nat hook prerouting priority dstnat; policy accept;"
@@ -197,7 +202,7 @@ render_rules() {
         echo "    type nat hook postrouting priority srcnat; policy accept;"
         echo "  }"
         echo "}"
-    } > "${RULES_FILE}"
+    } >> "${RULES_FILE}"
 
     while IFS= read -r line; do
         [ -z "$line" ] && continue
