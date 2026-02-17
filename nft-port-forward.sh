@@ -97,6 +97,17 @@ ensure_deps() {
         install_dependency nftables
     fi
 
+    if ! has_cmd ip; then
+        log_info "正在安装 iproute2..."
+        install_dependency iproute2
+    fi
+
+    if ! has_cmd sysctl; then
+        log_info "正在安装 procps..."
+        install_dependency procps
+        install_dependency procps-ng
+    fi
+
     if ! has_cmd host; then
         log_info "正在安装 DNS 查询工具..."
         if has_cmd apk; then
@@ -109,6 +120,16 @@ ensure_deps() {
 
     if ! has_cmd nft; then
         log_error "未找到 nft 命令，请手动安装 nftables 后重试"
+        exit 1
+    fi
+
+    if ! has_cmd ip; then
+        log_error "未找到 ip 命令，请手动安装 iproute2 后重试"
+        exit 1
+    fi
+
+    if ! has_cmd sysctl; then
+        log_error "未找到 sysctl 命令，请手动安装 procps 后重试"
         exit 1
     fi
 
@@ -132,6 +153,25 @@ ensure_ip_forward() {
     if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
         log_error "内核转发未开启: net.ipv4.ip_forward=0"
         return 1
+    fi
+
+    if [ "$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null)" = "1" ] || [ "$(cat /proc/sys/net/ipv4/conf/default/rp_filter 2>/dev/null)" = "1" ]; then
+        log_warn "检测到 rp_filter=1，可能影响端口转发，正在调整为 0"
+
+        if [ -f /etc/sysctl.conf ] && grep -Eq '^net\.ipv4\.conf\.all\.rp_filter[[:space:]]*=' /etc/sysctl.conf; then
+            sed -i 's/^net\.ipv4\.conf\.all\.rp_filter[[:space:]]*=.*/net.ipv4.conf.all.rp_filter=0/' /etc/sysctl.conf
+        elif ! grep -Eq '^net\.ipv4\.conf\.all\.rp_filter[[:space:]]*=[[:space:]]*0$' /etc/sysctl.conf 2>/dev/null; then
+            echo "net.ipv4.conf.all.rp_filter=0" >> /etc/sysctl.conf
+        fi
+
+        if [ -f /etc/sysctl.conf ] && grep -Eq '^net\.ipv4\.conf\.default\.rp_filter[[:space:]]*=' /etc/sysctl.conf; then
+            sed -i 's/^net\.ipv4\.conf\.default\.rp_filter[[:space:]]*=.*/net.ipv4.conf.default.rp_filter=0/' /etc/sysctl.conf
+        elif ! grep -Eq '^net\.ipv4\.conf\.default\.rp_filter[[:space:]]*=[[:space:]]*0$' /etc/sysctl.conf 2>/dev/null; then
+            echo "net.ipv4.conf.default.rp_filter=0" >> /etc/sysctl.conf
+        fi
+
+        sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
     fi
 }
 
