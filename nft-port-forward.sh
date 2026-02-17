@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 set -e
 
@@ -9,6 +9,7 @@ STATE_FILE="${BASE_DIR}/resolved"
 INSTALLED_SCRIPT="/usr/local/bin/dnat-nft"
 SERVICE_NAME="dnat-nft"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+OPENRC_SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
 TABLE_NAME="dnat_nft"
 
 RED='\033[0;31m'
@@ -37,6 +38,31 @@ need_root() {
 
 has_cmd() {
     command -v "$1" >/dev/null 2>&1
+}
+
+init_service_manager() {
+    if has_cmd systemctl; then
+        SERVICE_MANAGER="systemd"
+        SERVICE_ENABLE() { systemctl enable "$1" >/dev/null 2>&1; }
+        SERVICE_START() { systemctl start "$1" >/dev/null 2>&1; }
+        SERVICE_RESTART() { systemctl restart "$1" >/dev/null 2>&1; }
+        SERVICE_STOP() { systemctl stop "$1" >/dev/null 2>&1; }
+        SERVICE_DISABLE() { systemctl disable "$1" >/dev/null 2>&1; }
+    elif has_cmd rc-service; then
+        SERVICE_MANAGER="openrc"
+        SERVICE_ENABLE() { rc-update add "$1" default >/dev/null 2>&1; }
+        SERVICE_START() { rc-service "$1" start >/dev/null 2>&1; }
+        SERVICE_RESTART() { rc-service "$1" restart >/dev/null 2>&1 || rc-service "$1" start >/dev/null 2>&1; }
+        SERVICE_STOP() { rc-service "$1" stop >/dev/null 2>&1; }
+        SERVICE_DISABLE() { rc-update del "$1" default >/dev/null 2>&1; }
+    else
+        SERVICE_MANAGER="none"
+        SERVICE_ENABLE() { return 1; }
+        SERVICE_START() { return 1; }
+        SERVICE_RESTART() { return 1; }
+        SERVICE_STOP() { return 1; }
+        SERVICE_DISABLE() { return 1; }
+    fi
 }
 
 ensure_base() {
@@ -69,8 +95,12 @@ ensure_deps() {
 
     if ! has_cmd host; then
         log_info "正在安装 DNS 查询工具..."
-        install_dependency dnsutils
-        install_dependency bind-utils
+        if has_cmd apk; then
+            install_dependency bind-tools
+        else
+            install_dependency dnsutils
+            install_dependency bind-utils
+        fi
     fi
 
     if ! has_cmd nft; then
@@ -108,11 +138,31 @@ resolve_host() {
         return 0
     fi
 
-    if ! has_cmd host; then
-        return 1
+    if has_cmd host; then
+        host -t a "$target" 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1
+        return 0
     fi
 
-    host -t a "$target" 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1
+    if has_cmd getent; then
+        getent ahostsv4 "$target" 2>/dev/null | awk 'NR==1 {print $1; exit}'
+        return 0
+    fi
+
+    if has_cmd nslookup; then
+        nslookup "$target" 2>/dev/null | awk '/^Address[[:space:]]+[0-9]*:[[:space:]]/ {print $NF; exit}'
+        return 0
+    fi
+
+    if has_cmd dig; then
+        dig +short A "$target" 2>/dev/null | awk 'NR==1 {print $1; exit}'
+        return 0
+    fi
+
+    return 1
+}
+
+can_resolve_dns() {
+    has_cmd host || has_cmd getent || has_cmd nslookup || has_cmd dig
 }
 
 valid_port() {
@@ -188,7 +238,10 @@ setup_service() {
     cp "$src_path" "${INSTALLED_SCRIPT}"
     chmod +x "${INSTALLED_SCRIPT}"
 
-    cat > "${SERVICE_FILE}" <<EOF
+    init_service_manager
+
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=nftables DNAT auto updater
 After=network-online.target
@@ -204,9 +257,34 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
-    systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        SERVICE_ENABLE "${SERVICE_NAME}" || true
+        SERVICE_RESTART "${SERVICE_NAME}" || SERVICE_START "${SERVICE_NAME}" || true
+        return
+    fi
+
+    if [ "$SERVICE_MANAGER" = "openrc" ]; then
+        cat > "${OPENRC_SERVICE_FILE}" <<EOF
+#!/sbin/openrc-run
+name="dnat-nft"
+description="nftables DNAT auto updater"
+command="${INSTALLED_SCRIPT}"
+command_args="--daemon"
+command_background="yes"
+pidfile="/run/\${RC_SVCNAME}.pid"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod +x "${OPENRC_SERVICE_FILE}"
+        SERVICE_ENABLE "${SERVICE_NAME}" || true
+        SERVICE_RESTART "${SERVICE_NAME}" || SERVICE_START "${SERVICE_NAME}" || true
+        return
+    fi
+
+    log_warn "未检测到 systemd 或 OpenRC，已跳过服务持久化"
 }
 
 run_once() {
@@ -265,6 +343,11 @@ add_rule() {
         return 1
     fi
 
+    if ! echo "$remote_host" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && ! can_resolve_dns; then
+        log_error "当前系统缺少 DNS 解析命令，无法解析域名，请先安装 bind-tools 或直接填写 IP"
+        return 1
+    fi
+
     ensure_base
     if grep -qE "^${local_port}>" "${CONF_FILE}"; then
         sed -i "s#^${local_port}>.*#${local_port}>${remote_host}:${remote_port}#" "${CONF_FILE}"
@@ -309,8 +392,15 @@ show_nft() {
 uninstall_all() {
     need_root
 
-    if has_cmd systemctl; then
-        systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    init_service_manager
+
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        SERVICE_STOP "${SERVICE_NAME}" || true
+        SERVICE_DISABLE "${SERVICE_NAME}" || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    elif [ "$SERVICE_MANAGER" = "openrc" ]; then
+        SERVICE_STOP "${SERVICE_NAME}" || true
+        SERVICE_DISABLE "${SERVICE_NAME}" || true
     fi
 
     if has_cmd nft && nft list table ip "${TABLE_NAME}" >/dev/null 2>&1; then
@@ -319,11 +409,8 @@ uninstall_all() {
 
     rm -rf "${BASE_DIR}"
     rm -f "${SERVICE_FILE}"
+    rm -f "${OPENRC_SERVICE_FILE}"
     rm -f "${INSTALLED_SCRIPT}"
-
-    if has_cmd systemctl; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
-    fi
 
     log_info "已卸载 dnat-nft 并清理规则"
 }

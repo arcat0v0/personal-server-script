@@ -8,7 +8,7 @@
 |---|---|---|
 | `server-init.sh` | Debian/Ubuntu 一键初始化（用户、SSH、安全、防火墙、常用工具） | Debian / Ubuntu |
 | `server-init-alpine.sh` | Alpine 一键初始化（OpenRC + nftables） | Alpine Linux |
-| `nft-port-forward.sh` | nftables 一键端口转发（交互菜单 + systemd 持久化） | Linux + systemd |
+| `nft-port-forward.sh` | nftables 一键端口转发（交互菜单 + 自动持久化） | Linux（systemd / OpenRC） |
 | `aliyun-ecs-keepalive.py` | 阿里云 ECS 抢占式实例按流量阈值自动启停 | Python 3 |
 | `cloudflare-worker.js` | GitHub Keys 代理 Worker（国内网络可选） | Cloudflare Workers |
 | `config-template.dae` | dae 配置模板（CN 模式下使用） | dae |
@@ -101,7 +101,7 @@ sudo ./nft-port-forward.sh --uninstall
 说明：
 
 - 转发规则保存于 `/etc/dnat-nft/conf`
-- 自动生成并启用 `dnat-nft.service`
+- 自动按系统生成并启用守护服务（systemd: `dnat-nft.service`，OpenRC: `/etc/init.d/dnat-nft`）
 - 每 60 秒刷新域名解析并重建 nftables 规则
 - 卸载会清理 service、规则表与配置目录
 
