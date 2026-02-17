@@ -917,6 +917,33 @@ configure_crowdsec_bouncer() {
     log_info "Bouncer API key configured"
 }
 
+enable_alpine_edge_repositories() {
+    local edge_base="https://dl-cdn.alpinelinux.org/alpine/edge"
+    local repo=""
+
+    for repo in main community testing; do
+        local repo_url="${edge_base}/${repo}"
+        if ! grep -Fq "$repo_url" /etc/apk/repositories; then
+            log_info "Enabling Alpine edge/${repo} repository..."
+            printf "%s\n" "$repo_url" >> /etc/apk/repositories
+        fi
+    done
+}
+
+install_apk_with_edge_retry() {
+    if $PKG_INSTALL "$@"; then
+        return 0
+    fi
+
+    log_warn "Package install failed, enabling full Alpine edge repositories and retrying: $*"
+    enable_alpine_edge_repositories
+
+    log_info "Updating package lists after enabling edge repositories..."
+    $PKG_UPDATE
+
+    $PKG_INSTALL "$@"
+}
+
 install_crowdsec() {
     log_info "Installing CrowdSec for intrusion prevention..."
 
@@ -925,20 +952,14 @@ install_crowdsec() {
         return
     fi
 
-    local testing_repo="https://dl-cdn.alpinelinux.org/alpine/edge/testing"
-    if ! grep -q "$testing_repo" /etc/apk/repositories; then
-        log_info "Enabling Alpine edge testing repository..."
-        printf "%s\n" "$testing_repo" >> /etc/apk/repositories
-    fi
-
     log_info "Updating package lists..."
     $PKG_UPDATE
 
     log_info "Installing CrowdSec packages..."
-    $PKG_INSTALL crowdsec crowdsec-openrc
+    install_apk_with_edge_retry crowdsec crowdsec-openrc
 
     log_info "Installing CrowdSec firewall bouncer..."
-    $PKG_INSTALL cs-firewall-bouncer cs-firewall-bouncer-openrc ipset
+    install_apk_with_edge_retry cs-firewall-bouncer cs-firewall-bouncer-openrc ipset
 
     sanitize_crowdsec_online_credentials
     ensure_crowdsec_acquisition_datasource
