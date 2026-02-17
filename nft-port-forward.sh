@@ -11,6 +11,9 @@ SERVICE_NAME="dnat-nft"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 OPENRC_SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
 TABLE_NAME="dnat_nft"
+NFT_MAIN_CONF=""
+NFT_INCLUDE_DIR="/etc/nftables.d"
+NFT_PERSIST_FILE=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -18,15 +21,15 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+    printf '%b\n' "${GREEN}[INFO]${NC} $1"
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    printf '%b\n' "${YELLOW}[WARN]${NC} $1"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    printf '%b\n' "${RED}[ERROR]${NC} $1"
 }
 
 need_root() {
@@ -68,6 +71,7 @@ init_service_manager() {
 ensure_base() {
     mkdir -p "${BASE_DIR}"
     touch "${CONF_FILE}"
+    touch "${STATE_FILE}"
 }
 
 install_dependency() {
@@ -114,11 +118,21 @@ ensure_deps() {
 }
 
 ensure_ip_forward() {
-    if ! grep -q "^net.ipv4.ip_forward=1$" /etc/sysctl.conf 2>/dev/null; then
+    if [ -f /etc/sysctl.conf ] && grep -Eq '^net\.ipv4\.ip_forward[[:space:]]*=' /etc/sysctl.conf; then
+        sed -i 's/^net\.ipv4\.ip_forward[[:space:]]*=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+    elif ! grep -Eq '^net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*1$' /etc/sysctl.conf 2>/dev/null; then
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
     fi
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-    sysctl -p >/dev/null 2>&1 || true
+
+    if ! sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; then
+        log_error "启用 net.ipv4.ip_forward 失败"
+        return 1
+    fi
+
+    if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
+        log_error "内核转发未开启: net.ipv4.ip_forward=0"
+        return 1
+    fi
 }
 
 get_local_ip() {
@@ -177,14 +191,6 @@ valid_port() {
 }
 
 render_rules() {
-    local local_ip
-    local_ip="$(get_local_ip)"
-
-    if [ -z "$local_ip" ]; then
-        log_error "无法检测本机 IPv4 地址"
-        return 1
-    fi
-
     : > "${STATE_FILE}"
 
     if nft list table ip "${TABLE_NAME}" >/dev/null 2>&1; then
@@ -197,6 +203,9 @@ render_rules() {
         echo "table ip ${TABLE_NAME} {"
         echo "  chain prerouting {"
         echo "    type nat hook prerouting priority dstnat; policy accept;"
+        echo "  }"
+        echo "  chain output {"
+        echo "    type nat hook output priority dstnat; policy accept;"
         echo "  }"
         echo "  chain postrouting {"
         echo "    type nat hook postrouting priority srcnat; policy accept;"
@@ -227,14 +236,459 @@ render_rules() {
         {
             echo "add rule ip ${TABLE_NAME} prerouting tcp dport ${local_port} dnat to ${remote_ip}:${remote_port} comment \"DNAT TCP ${local_port}->${remote_host}:${remote_port}\""
             echo "add rule ip ${TABLE_NAME} prerouting udp dport ${local_port} dnat to ${remote_ip}:${remote_port} comment \"DNAT UDP ${local_port}->${remote_host}:${remote_port}\""
-            echo "add rule ip ${TABLE_NAME} postrouting ip daddr ${remote_ip} tcp dport ${remote_port} snat to ${local_ip} comment \"SNAT TCP ${remote_host}:${remote_port}\""
-            echo "add rule ip ${TABLE_NAME} postrouting ip daddr ${remote_ip} udp dport ${remote_port} snat to ${local_ip} comment \"SNAT UDP ${remote_host}:${remote_port}\""
+            echo "add rule ip ${TABLE_NAME} output fib daddr type local tcp dport ${local_port} dnat to ${remote_ip}:${remote_port} comment \"DNAT OUTPUT TCP ${local_port}->${remote_host}:${remote_port}\""
+            echo "add rule ip ${TABLE_NAME} output fib daddr type local udp dport ${local_port} dnat to ${remote_ip}:${remote_port} comment \"DNAT OUTPUT UDP ${local_port}->${remote_host}:${remote_port}\""
+            echo "add rule ip ${TABLE_NAME} postrouting ip daddr ${remote_ip} tcp dport ${remote_port} masquerade comment \"MASQ TCP ${remote_host}:${remote_port}\""
+            echo "add rule ip ${TABLE_NAME} postrouting ip daddr ${remote_ip} udp dport ${remote_port} masquerade comment \"MASQ UDP ${remote_host}:${remote_port}\""
         } >> "${RULES_FILE}"
     done < "${CONF_FILE}"
 }
 
 apply_rules() {
     nft -f "${RULES_FILE}"
+}
+
+list_forward_base_chains() {
+    nft list tables 2>/dev/null | while IFS=' ' read -r kind family table; do
+        [ "$kind" = "table" ] || continue
+        [ -z "$family" ] && continue
+        [ -z "$table" ] && continue
+
+        nft list table "$family" "$table" 2>/dev/null | awk -v family="$family" -v table="$table" '
+            $1 == "chain" {
+                chain = $2
+                sub("\\{$", "", chain)
+            }
+            $0 ~ /hook[[:space:]]+forward/ {
+                if (family == "ip" || family == "ip6" || family == "inet") {
+                    print family "|" table "|" chain
+                }
+            }
+        '
+    done
+}
+
+init_nft_persistence_paths() {
+    # Guard: only re-init if BOTH are set (fully initialized)
+    if [ -n "$NFT_MAIN_CONF" ] && [ -n "$NFT_PERSIST_FILE" ]; then
+        return 0
+    fi
+
+    # Reset to ensure clean state
+    NFT_MAIN_CONF=""
+    NFT_PERSIST_FILE=""
+    NFT_INCLUDE_DIR=""
+
+    # Detect main config path
+    local alpine_rules_file=""
+    if [ -f /etc/conf.d/nftables ]; then
+        alpine_rules_file="$(sed -n 's/^[[:space:]]*rules_file=["'"'"']\{0,1\}\([^"'"'"'[:space:]]\+\)["'"'"']\{0,1\}[[:space:]]*$/\1/p' /etc/conf.d/nftables | tail -n1 || true)"
+    fi
+
+    if [ -n "$alpine_rules_file" ]; then
+        NFT_MAIN_CONF="$alpine_rules_file"
+    elif [ -f /etc/nftables.nft ]; then
+        NFT_MAIN_CONF="/etc/nftables.nft"
+    elif [ -f /etc/nftables.conf ]; then
+        NFT_MAIN_CONF="/etc/nftables.conf"
+    elif [ -x /sbin/openrc-run ] || [ -d /run/openrc ]; then
+        NFT_MAIN_CONF="/etc/nftables.nft"
+    else
+        NFT_MAIN_CONF="/etc/nftables.conf"
+    fi
+
+    # Parse include directory from main config
+    local include_path=""
+    local include_candidates=""
+    local preferred_include=""
+    if [ -f "$NFT_MAIN_CONF" ]; then
+        include_candidates="$(sed -n 's/^[[:space:]]*include[[:space:]]*"\([^"]*\)".*/\1/p' "$NFT_MAIN_CONF" | grep -E '/\*\.nft$|\.nft$' || true)"
+
+        if [ -n "$include_candidates" ]; then
+            preferred_include="$(printf '%s\n' "$include_candidates" | grep -E '/etc/nftables\.d/(\*\.nft|[^/]+\.nft)$' | head -n1 || true)"
+            if [ -z "$preferred_include" ]; then
+                preferred_include="$(printf '%s\n' "$include_candidates" | grep -Ev '^/var/lib/nftables/(\*\.nft|[^/]+\.nft)$' | head -n1 || true)"
+            fi
+            if [ -z "$preferred_include" ]; then
+                preferred_include="$(printf '%s\n' "$include_candidates" | head -n1 || true)"
+            fi
+            include_path="$preferred_include"
+        fi
+    fi
+
+    if [ -n "$include_path" ]; then
+        case "$include_path" in
+            */*.nft)
+                NFT_INCLUDE_DIR="${include_path%/*.nft}"
+                ;;
+            *.nft)
+                NFT_INCLUDE_DIR="$(dirname "$include_path")"
+                ;;
+        esac
+    fi
+
+    [ -n "$NFT_INCLUDE_DIR" ] || NFT_INCLUDE_DIR="/etc/nftables.d"
+
+    NFT_PERSIST_FILE="${NFT_INCLUDE_DIR}/dnat-nft.nft"
+}
+
+rebuild_state_file_from_conf() {
+    local line
+    local local_port
+    local right
+    local remote_host
+    local remote_port
+    local remote_ip
+
+    [ -s "${CONF_FILE}" ] || return 0
+
+    : > "${STATE_FILE}"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        case "$line" in
+            *">"*":"*) ;;
+            *)
+                log_warn "忽略无效配置行: $line"
+                continue
+                ;;
+        esac
+
+        local_port="${line%%>*}"
+        right="${line#*>}"
+        remote_host="${right%:*}"
+        remote_port="${right##*:}"
+        remote_ip="$(resolve_host "$remote_host")"
+
+        if [ -z "$remote_ip" ]; then
+            log_warn "持久化跳过: 无法解析 ${remote_host}"
+            continue
+        fi
+
+        printf '%s>%s:%s=%s\n' "$local_port" "$remote_host" "$remote_port" "$remote_ip" >> "${STATE_FILE}"
+    done < "${CONF_FILE}"
+}
+
+run_nft_with_context() {
+    local context="$1"
+    shift
+    local err
+
+    if err="$(nft "$@" 2>&1)"; then
+        return 0
+    fi
+
+    log_warn "${context}: ${err}"
+    return 1
+}
+
+list_managed_forward_rule_handles() {
+    local family="$1"
+    local table="$2"
+    local chain="$3"
+
+    nft -a list chain "$family" "$table" "$chain" 2>/dev/null | awk '
+        /comment "(dnat_nft_allow_|dnat_nft_fb_)/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "handle" && (i + 1) <= NF) {
+                    print $(i + 1)
+                    break
+                }
+            }
+        }
+    '
+}
+
+delete_managed_forward_rules() {
+    local family="$1"
+    local table="$2"
+    local chain="$3"
+    local handles
+    local handle
+
+    handles="$(list_managed_forward_rule_handles "$family" "$table" "$chain")"
+    [ -z "$handles" ] && return 0
+
+    while IFS= read -r handle; do
+        [ -z "$handle" ] && continue
+        run_nft_with_context "无法删除旧的 forward 托管规则: ${family}/${table}/${chain}#${handle}" \
+            delete rule "$family" "$table" "$chain" handle "$handle" || true
+    done <<EOF
+$handles
+EOF
+}
+
+ensure_forward_fallback_rules() {
+    local family="$1"
+    local table="$2"
+    local chain="$3"
+    local line
+    local left
+    local local_port
+    local right
+    local remote_host
+    local remote_port
+    local remote_ip
+    local c_req_tcp
+    local c_req_udp
+    local c_rsp_tcp
+    local c_rsp_udp
+
+    case "$family" in
+        ip|inet) ;;
+        *) return 0 ;;
+    esac
+
+    [ -s "$STATE_FILE" ] || return 0
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        left="${line%%=*}"
+        remote_ip="${line##*=}"
+        local_port="${left%%>*}"
+        right="${left#*>}"
+        remote_host="${right%:*}"
+        remote_port="${right##*:}"
+
+        c_req_tcp="dnat_nft_fb_tcp_req_${local_port}_${remote_port}"
+        c_req_udp="dnat_nft_fb_udp_req_${local_port}_${remote_port}"
+        c_rsp_tcp="dnat_nft_fb_tcp_rsp_${local_port}_${remote_port}"
+        c_rsp_udp="dnat_nft_fb_udp_rsp_${local_port}_${remote_port}"
+
+        if ! nft list chain "$family" "$table" "$chain" 2>/dev/null | grep -Fq "$c_req_tcp"; then
+            run_nft_with_context "无法插入 forward 放行规则(fallback tcp req): ${family}/${table}/${chain}" \
+                insert rule "$family" "$table" "$chain" ip daddr "$remote_ip" tcp dport "$remote_port" accept comment "$c_req_tcp" || true
+        fi
+
+        if ! nft list chain "$family" "$table" "$chain" 2>/dev/null | grep -Fq "$c_req_udp"; then
+            run_nft_with_context "无法插入 forward 放行规则(fallback udp req): ${family}/${table}/${chain}" \
+                insert rule "$family" "$table" "$chain" ip daddr "$remote_ip" udp dport "$remote_port" accept comment "$c_req_udp" || true
+        fi
+
+        if ! nft list chain "$family" "$table" "$chain" 2>/dev/null | grep -Fq "$c_rsp_tcp"; then
+            run_nft_with_context "无法插入 forward 放行规则(fallback tcp rsp): ${family}/${table}/${chain}" \
+                insert rule "$family" "$table" "$chain" ip saddr "$remote_ip" tcp sport "$remote_port" accept comment "$c_rsp_tcp" || true
+        fi
+
+        if ! nft list chain "$family" "$table" "$chain" 2>/dev/null | grep -Fq "$c_rsp_udp"; then
+            run_nft_with_context "无法插入 forward 放行规则(fallback udp rsp): ${family}/${table}/${chain}" \
+                insert rule "$family" "$table" "$chain" ip saddr "$remote_ip" udp sport "$remote_port" accept comment "$c_rsp_udp" || true
+        fi
+    done < "$STATE_FILE"
+}
+
+ensure_forward_accept_rules() {
+    local chains
+    local line
+    local family
+    local table
+    local chain
+    local ct_est_comment="dnat_nft_allow_established"
+    local ct_dnat_comment="dnat_nft_allow_dnat"
+    local has_chain=0
+    local has_state_rules=0
+    local need_fallback=0
+
+    chains=""
+
+    if nft list chain inet filter forward >/dev/null 2>&1; then
+        chains="inet|filter|forward"
+    fi
+
+    line="$(list_forward_base_chains | sort -u)"
+    if [ -n "$line" ]; then
+        if [ -n "$chains" ]; then
+            chains="${chains}\n${line}"
+        else
+            chains="$line"
+        fi
+    fi
+
+    chains="$(printf '%b\n' "$chains" | awk 'NF { if (!seen[$0]++) print $0 }')"
+    if [ -z "$chains" ]; then
+        log_warn "未检测到 forward 基链，未插入 dnat-nft 放行规则"
+        return 0
+    fi
+
+    if [ -s "$STATE_FILE" ]; then
+        has_state_rules=1
+    fi
+
+    while IFS='|' read -r family table chain; do
+        [ -z "$family" ] && continue
+        [ -z "$table" ] && continue
+        [ -z "$chain" ] && continue
+        has_chain=1
+
+        delete_managed_forward_rules "$family" "$table" "$chain"
+
+        [ "$has_state_rules" -eq 1 ] || continue
+
+        need_fallback=0
+
+        if ! run_nft_with_context "无法插入 forward 放行规则(ct established): ${family}/${table}/${chain}" \
+            insert rule "$family" "$table" "$chain" ct state established,related accept comment "$ct_est_comment"; then
+            need_fallback=1
+        fi
+
+        if ! run_nft_with_context "无法插入 forward 放行规则(ct dnat): ${family}/${table}/${chain}" \
+            insert rule "$family" "$table" "$chain" ct status dnat accept comment "$ct_dnat_comment"; then
+            need_fallback=1
+        fi
+
+        if [ "$need_fallback" -eq 1 ]; then
+            ensure_forward_fallback_rules "$family" "$table" "$chain"
+        fi
+    done <<EOF
+$chains
+EOF
+
+    [ "$has_chain" -eq 0 ] && log_warn "未检测到可写入的 forward 基链"
+}
+
+render_persistent_rules_file() {
+    local tmp_file
+    local line
+    local left
+    local local_port
+    local right
+    local remote_host
+    local remote_port
+    local remote_ip
+
+    init_nft_persistence_paths
+
+    if [ ! -f "${STATE_FILE}" ]; then
+        touch "${STATE_FILE}" || return 1
+    fi
+
+    if [ ! -s "${STATE_FILE}" ]; then
+        rebuild_state_file_from_conf
+    fi
+
+    tmp_file="${NFT_PERSIST_FILE}.tmp"
+    mkdir -p "${NFT_INCLUDE_DIR}"
+
+    {
+        echo "# Managed by dnat-nft"
+        echo "table ip ${TABLE_NAME} {"
+        echo "  chain prerouting {"
+        echo "    type nat hook prerouting priority dstnat; policy accept;"
+
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            left="${line%%=*}"
+            remote_ip="${line##*=}"
+            local_port="${left%%>*}"
+            right="${left#*>}"
+            remote_host="${right%:*}"
+            remote_port="${right##*:}"
+
+            echo "    tcp dport ${local_port} dnat to ${remote_ip}:${remote_port} comment \"DNAT TCP ${local_port}->${remote_host}:${remote_port}\""
+            echo "    udp dport ${local_port} dnat to ${remote_ip}:${remote_port} comment \"DNAT UDP ${local_port}->${remote_host}:${remote_port}\""
+        done < "${STATE_FILE}"
+
+        echo "  }"
+        echo "  chain output {"
+        echo "    type nat hook output priority dstnat; policy accept;"
+
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            left="${line%%=*}"
+            remote_ip="${line##*=}"
+            local_port="${left%%>*}"
+            right="${left#*>}"
+            remote_host="${right%:*}"
+            remote_port="${right##*:}"
+
+            echo "    fib daddr type local tcp dport ${local_port} dnat to ${remote_ip}:${remote_port} comment \"DNAT OUTPUT TCP ${local_port}->${remote_host}:${remote_port}\""
+            echo "    fib daddr type local udp dport ${local_port} dnat to ${remote_ip}:${remote_port} comment \"DNAT OUTPUT UDP ${local_port}->${remote_host}:${remote_port}\""
+        done < "${STATE_FILE}"
+
+        echo "  }"
+        echo "  chain postrouting {"
+        echo "    type nat hook postrouting priority srcnat; policy accept;"
+
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            left="${line%%=*}"
+            remote_ip="${line##*=}"
+            right="${left#*>}"
+            remote_host="${right%:*}"
+            remote_port="${right##*:}"
+
+            echo "    ip daddr ${remote_ip} tcp dport ${remote_port} masquerade comment \"MASQ TCP ${remote_host}:${remote_port}\""
+            echo "    ip daddr ${remote_ip} udp dport ${remote_port} masquerade comment \"MASQ UDP ${remote_host}:${remote_port}\""
+        done < "${STATE_FILE}"
+
+        echo "  }"
+        echo "}"
+    } > "$tmp_file"
+
+    mv "$tmp_file" "${NFT_PERSIST_FILE}"
+}
+
+ensure_nft_main_include() {
+    init_nft_persistence_paths
+
+    if [ ! -f "${NFT_MAIN_CONF}" ]; then
+        cat > "${NFT_MAIN_CONF}" <<EOF
+flush ruleset
+
+include "/var/lib/nftables/*.nft"
+include "${NFT_INCLUDE_DIR}/*.nft"
+EOF
+        return 0
+    fi
+
+    local escaped_dir
+    escaped_dir="$(printf '%s' "$NFT_INCLUDE_DIR" | sed 's/[.[\*^$/]/\\&/g')"
+
+    if grep -Eq "^[[:space:]]*include[[:space:]]+\"${escaped_dir}/(\\*\\.nft|dnat-nft\\.nft)\"" "${NFT_MAIN_CONF}" 2>/dev/null; then
+        return 0
+    fi
+
+    printf '\ninclude "%s/*.nft"\n' "${NFT_INCLUDE_DIR}" >> "${NFT_MAIN_CONF}"
+}
+
+enable_nftables_boot_load() {
+    init_service_manager
+
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        if systemctl list-unit-files 2>/dev/null | grep -q '^nftables\.service'; then
+            SERVICE_ENABLE nftables || true
+        fi
+    elif [ "$SERVICE_MANAGER" = "openrc" ]; then
+        if [ -x /etc/init.d/nftables ]; then
+            SERVICE_ENABLE nftables || true
+        fi
+    fi
+}
+
+persist_nft_config() {
+    init_nft_persistence_paths
+
+    if [ -z "$NFT_PERSIST_FILE" ]; then
+        log_warn "无法确定 nft 持久化文件路径"
+        return 0
+    fi
+
+    if ! render_persistent_rules_file; then
+        log_warn "写入 nft 持久化配置失败: ${NFT_PERSIST_FILE}"
+        return 0
+    fi
+
+    if ! ensure_nft_main_include; then
+        log_warn "更新 nft 主配置失败: ${NFT_MAIN_CONF}"
+        return 0
+    fi
+
+    if [ ! -f "${NFT_PERSIST_FILE}" ]; then
+        log_warn "nft 持久化文件未生成: ${NFT_PERSIST_FILE}"
+        return 0
+    fi
+
+    enable_nftables_boot_load
+    log_info "nft 持久化配置已写入: ${NFT_PERSIST_FILE}"
 }
 
 setup_service() {
@@ -299,6 +753,8 @@ run_once() {
     ensure_ip_forward
     render_rules
     apply_rules
+    ensure_forward_accept_rules
+    persist_nft_config
 }
 
 run_daemon() {
@@ -360,8 +816,15 @@ add_rule() {
         echo "${local_port}>${remote_host}:${remote_port}" >> "${CONF_FILE}"
     fi
 
-    run_once
-    setup_service
+    if ! run_once; then
+        log_error "转发规则应用失败"
+        return 1
+    fi
+
+    if ! setup_service; then
+        log_warn "服务持久化配置失败，但当前规则可能已生效"
+    fi
+
     log_info "转发规则已生效: ${local_port} -> ${remote_host}:${remote_port}"
 }
 
@@ -378,11 +841,18 @@ remove_rule() {
         return 0
     fi
 
-    grep -vE "^${local_port}>" "${CONF_FILE}" > "${CONF_FILE}.tmp"
+    sed "/^${local_port}>/d" "${CONF_FILE}" > "${CONF_FILE}.tmp"
     mv "${CONF_FILE}.tmp" "${CONF_FILE}"
 
-    run_once
-    setup_service
+    if ! run_once; then
+        log_error "删除规则后重载失败"
+        return 1
+    fi
+
+    if ! setup_service; then
+        log_warn "服务持久化配置失败，但当前规则可能已生效"
+    fi
+
     log_info "已删除端口 ${local_port} 的转发规则"
 }
 
@@ -408,8 +878,20 @@ uninstall_all() {
         SERVICE_DISABLE "${SERVICE_NAME}" || true
     fi
 
+    init_nft_persistence_paths
+
     if has_cmd nft && nft list table ip "${TABLE_NAME}" >/dev/null 2>&1; then
         nft delete table ip "${TABLE_NAME}" >/dev/null 2>&1 || true
+    fi
+
+    rm -f "${NFT_PERSIST_FILE}"
+
+    if [ -f "${NFT_MAIN_CONF}" ] && [ -n "${NFT_INCLUDE_DIR}" ]; then
+        local escaped_dir
+        escaped_dir="$(printf '%s' "$NFT_INCLUDE_DIR" | sed 's/[.[\*^$/]/\\&/g')"
+        if grep -Eq "^[[:space:]]*include[[:space:]]+\"${escaped_dir}/" "${NFT_MAIN_CONF}" 2>/dev/null; then
+            grep -Ev "^[[:space:]]*include[[:space:]]+\"${escaped_dir}/(\\*\\.nft|dnat-nft\\.nft)\"" "${NFT_MAIN_CONF}" > "${NFT_MAIN_CONF}.tmp" && mv "${NFT_MAIN_CONF}.tmp" "${NFT_MAIN_CONF}"
+        fi
     fi
 
     rm -rf "${BASE_DIR}"
