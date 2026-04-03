@@ -173,11 +173,11 @@ prompt_dae_subscription() {
     fi
 
     echo ""
-    log_info "CN mode detected: dae will be installed and configured"
-    read -p "$(printf "%b" "${YELLOW}[PROMPT]${NC} Enter dae subscription URL (my_sub): ")" -r < /dev/tty || return 1
+    log_info "CN mode detected: dae subscription is optional"
+    read -p "$(printf "%b" "${YELLOW}[PROMPT]${NC} Enter dae subscription URL (my_sub, press Enter to skip): ")" -r < /dev/tty || return 1
     if [ -z "$REPLY" ]; then
-        log_error "Subscription URL is required for dae configuration"
-        return 1
+        log_warn "No dae subscription URL provided, skipping dae installation"
+        return
     fi
     DAE_SUBSCRIPTION_URL="$REPLY"
 }
@@ -315,7 +315,7 @@ parse_arguments() {
                 echo "Options:"
                 echo "  -a, --add-users         Enable adding additional users (will prompt for details)"
                 echo "  -u, --users USERS       Specify additional users (semicolon-separated)"
-                echo "      --dae-sub URL       Set dae subscription URL (my_sub)"
+                echo "      --dae-sub URL       Optional: set dae subscription URL (my_sub)"
                 echo "      --cn                Force China optimized addresses"
                 echo "      --firewall FW       Firewall implementation (default: nftables)"
                 echo "                          FW: nftables | ufw"
@@ -328,7 +328,7 @@ parse_arguments() {
                 echo "  $0                                    # Run with interactive prompts"
                 echo "  $0 -a                                 # Enable additional users, will prompt for details"
                 echo "  $0 -u 'alice@url:nopasswd;bob@url:sudo;charlie@url'"
-                echo "  $0 --cn --dae-sub URL                 # CN mode with dae subscription URL"
+                echo "  $0 --cn --dae-sub URL                 # CN mode with optional dae subscription URL"
                 echo "  $0 --cn                               # Force China optimized addresses"
                 exit 0
                 ;;
@@ -1165,11 +1165,11 @@ main() {
     update_system
 
     if is_cn_machine; then
-        if ! prompt_dae_subscription; then
-            exit 1
+        prompt_dae_subscription
+        if [ -n "$DAE_SUBSCRIPTION_URL" ]; then
+            install_dae
+            configure_dae
         fi
-        install_dae
-        configure_dae
     fi
 
     create_user
@@ -1200,8 +1200,12 @@ main() {
     log_info "Hostname resolution has been configured"
     log_info "Root login has been disabled"
     if is_cn_machine; then
-        log_info "dae has been installed and configured"
-        log_info "dae config location: /usr/local/etc/dae/config.dae"
+        if [ -n "$DAE_SUBSCRIPTION_URL" ]; then
+            log_info "dae has been installed and configured"
+            log_info "dae config location: /usr/local/etc/dae/config.dae"
+        else
+            log_info "dae installation skipped (no subscription URL provided)"
+        fi
     else
         log_info "Zsh with oh-my-zsh has been installed"
         log_info "Starship prompt has been configured with plain-text-symbols preset"
