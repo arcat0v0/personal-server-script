@@ -23,6 +23,9 @@
 
 set -e
 
+# Ensure sbin directories are in PATH (minimal containers may omit them)
+export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+
 # Global variables
 ADDITIONAL_USERS=""
 ADD_ADDITIONAL_USERS=false
@@ -508,11 +511,11 @@ create_user() {
     if id "$username" &>/dev/null; then
         log_warn "User $username already exists, skipping creation"
     else
-        /usr/sbin/useradd -m -s /bin/bash "$username"
+        useradd -m -s /bin/bash "$username"
         log_info "User $username created"
     fi
 
-    /usr/sbin/usermod -aG sudo "$username"
+    usermod -aG sudo "$username"
 
     # Configure passwordless sudo
     echo "$username ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$username"
@@ -606,7 +609,7 @@ create_additional_users() {
             log_info "Updating SSH keys for existing user: $username"
         else
             # Create user
-            if /usr/sbin/useradd -m -s /bin/bash "$username"; then
+            if useradd -m -s /bin/bash "$username"; then
                 log_info "User $username created"
             else
                 log_error "Failed to create user: $username"
@@ -618,7 +621,7 @@ create_additional_users() {
         # Configure sudo privileges
         if [ "$sudo_type" != "none" ]; then
             log_info "Adding $username to sudo group..."
-            /usr/sbin/usermod -aG sudo "$username"
+            usermod -aG sudo "$username"
 
             if [ "$sudo_type" == "nopasswd" ]; then
                 # Configure passwordless sudo
