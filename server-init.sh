@@ -508,11 +508,11 @@ create_user() {
     if id "$username" &>/dev/null; then
         log_warn "User $username already exists, skipping creation"
     else
-        useradd -m -s /bin/bash "$username"
+        /usr/sbin/useradd -m -s /bin/bash "$username"
         log_info "User $username created"
     fi
 
-    usermod -aG sudo "$username"
+    /usr/sbin/usermod -aG sudo "$username"
 
     # Configure passwordless sudo
     echo "$username ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$username"
@@ -606,7 +606,7 @@ create_additional_users() {
             log_info "Updating SSH keys for existing user: $username"
         else
             # Create user
-            if useradd -m -s /bin/bash "$username"; then
+            if /usr/sbin/useradd -m -s /bin/bash "$username"; then
                 log_info "User $username created"
             else
                 log_error "Failed to create user: $username"
@@ -618,7 +618,7 @@ create_additional_users() {
         # Configure sudo privileges
         if [ "$sudo_type" != "none" ]; then
             log_info "Adding $username to sudo group..."
-            usermod -aG sudo "$username"
+            /usr/sbin/usermod -aG sudo "$username"
 
             if [ "$sudo_type" == "nopasswd" ]; then
                 # Configure passwordless sudo
