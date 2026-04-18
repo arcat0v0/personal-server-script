@@ -45,6 +45,7 @@ python aliyun-ecs-keepalive.py --help
 ## `server-init*` 功能清单
 
 - 系统更新与基础工具安装
+- 国内网络下自动切换 APT / APK 官方仓库到国内镜像
 - 新建用户并导入 SSH 公钥
 - SSH 安全加固（禁 root、禁密码登录）
 - 防火墙配置（Debian/Ubuntu 支持 `ufw` 或 `nftables`，Alpine 使用 `nftables`）
@@ -69,6 +70,8 @@ sudo ./server-init.sh --cn --dae-sub "https://example.com/subscription"
 - `--firewall`: `nftables` 或 `ufw`
 - `--cn`: 强制启用中国网络优化地址
 - `--dae-sub`: dae 配置里的订阅地址
+- 国内源默认使用 `USTC`，可通过 `CN_MIRROR_PROVIDER=ustc|tuna|aliyun` 切换
+- 也可直接覆盖 `CN_APT_MIRROR_BASE`、`CN_APT_SECURITY_MIRROR_BASE`、`CN_APT_PORTS_MIRROR_BASE`
 
 ### `server-init-alpine.sh`（Alpine）
 
@@ -81,6 +84,14 @@ sudo ./server-init-alpine.sh --cn --dae-sub "https://example.com/subscription"
 
 - 支持 `-a`、`-u`、`--cn`、`--dae-sub`
 - 防火墙默认使用 nftables
+- 国内源默认使用 `USTC`，可通过 `CN_MIRROR_PROVIDER=ustc|tuna|aliyun` 或 `CN_APK_MIRROR_BASE` 覆盖
+
+## 国内镜像说明
+
+- `--cn` 或 `FORCE_CN=1` 时，会优先把系统包管理器官方仓库切到国内镜像，再执行 `apt update` / `apk update`
+- 未强制 `--cn` 时，脚本会在装好 `curl` 后做一次 CN 网络探测；探测到国内环境后，也会在系统更新前切换镜像
+- Debian/Ubuntu 只替换官方仓库 URL，保留现有 suites / components，不重写第三方源
+- Alpine 会同步替换 `/etc/apk/repositories`，并让后续追加的 `edge` 仓库也沿用同一镜像基址
 
 ## `nft-port-forward.sh` 用法
 

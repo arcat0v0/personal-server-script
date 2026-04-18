@@ -31,9 +31,12 @@ DAE_CONFIG_TEMPLATE_URL="https://raw.githubusercontent.com/arcat0v0/personal-ser
 CN_HTTP_PROXY="${CN_HTTP_PROXY:-}"
 CN_PROXY_PREFIX="${CN_PROXY_PREFIX:-https://ghfast.top/}"
 CN_GIT_MIRROR_BASE="${CN_GIT_MIRROR_BASE:-https://gitee.com/mirrors}"
+CN_MIRROR_PROVIDER="${CN_MIRROR_PROVIDER:-ustc}"
+CN_APK_MIRROR_BASE="${CN_APK_MIRROR_BASE:-}"
 
 IS_CN_MACHINE=""
 FORCE_CN="${FORCE_CN:-}"
+PACKAGE_MIRROR_CONFIGURED="false"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -54,6 +57,15 @@ log_error() {
 
 has_cmd() {
     command -v "$1" >/dev/null 2>&1
+}
+
+backup_file_once() {
+    local file="$1"
+    local backup="${file}.bak.personal-server-script"
+
+    if [ -f "$file" ] && [ ! -f "$backup" ]; then
+        cp "$file" "$backup"
+    fi
 }
 
 can_prompt() {
@@ -161,6 +173,84 @@ report_cn_optimization() {
     fi
 }
 
+normalize_cn_mirror_provider() {
+    case "$CN_MIRROR_PROVIDER" in
+        ustc|tuna|aliyun)
+            ;;
+        *)
+            log_warn "Unknown CN_MIRROR_PROVIDER '$CN_MIRROR_PROVIDER', falling back to ustc"
+            CN_MIRROR_PROVIDER="ustc"
+            ;;
+    esac
+}
+
+get_apk_mirror_base() {
+    if [ -n "$CN_APK_MIRROR_BASE" ]; then
+        printf '%s\n' "$CN_APK_MIRROR_BASE"
+        return 0
+    fi
+
+    normalize_cn_mirror_provider
+
+    case "$CN_MIRROR_PROVIDER" in
+        ustc) printf '%s\n' "https://mirrors.ustc.edu.cn/alpine" ;;
+        tuna) printf '%s\n' "https://mirrors.tuna.tsinghua.edu.cn/alpine" ;;
+        aliyun) printf '%s\n' "https://mirrors.aliyun.com/alpine" ;;
+        *) return 1 ;;
+    esac
+}
+
+get_alpine_repository_base() {
+    if is_cn_machine; then
+        get_apk_mirror_base
+    else
+        printf '%s\n' "https://dl-cdn.alpinelinux.org/alpine"
+    fi
+}
+
+configure_package_mirrors() {
+    local repo_file="/etc/apk/repositories"
+    local mirror_base=""
+    local tmp_file=""
+
+    if [ "$PACKAGE_MIRROR_CONFIGURED" = "true" ]; then
+        return 0
+    fi
+
+    if ! is_cn_machine; then
+        return 0
+    fi
+
+    if [ ! -f "$repo_file" ]; then
+        log_warn "APK repository file not found: $repo_file"
+        PACKAGE_MIRROR_CONFIGURED="true"
+        return 0
+    fi
+
+    mirror_base=$(get_apk_mirror_base) || {
+        log_warn "Failed to resolve APK mirror base, skipping mirror replacement"
+        PACKAGE_MIRROR_CONFIGURED="true"
+        return 0
+    }
+
+    log_info "Configuring APK mirrors for CN (provider: $CN_MIRROR_PROVIDER)..."
+
+    tmp_file=$(mktemp)
+    sed -E "s|https?://[^[:space:]]*alpinelinux\.org/alpine|$mirror_base|g" "$repo_file" > "$tmp_file"
+
+    if cmp -s "$repo_file" "$tmp_file"; then
+        rm -f "$tmp_file"
+        log_info "APK repositories already use compatible mirrors or no official URLs matched"
+        PACKAGE_MIRROR_CONFIGURED="true"
+        return 0
+    fi
+
+    backup_file_once "$repo_file"
+    mv "$tmp_file" "$repo_file"
+    log_info "APK mirror configured: $mirror_base"
+    PACKAGE_MIRROR_CONFIGURED="true"
+}
+
 prompt_dae_subscription() {
     if [ -n "$DAE_SUBSCRIPTION_URL" ]; then
         return
@@ -239,6 +329,10 @@ detect_os() {
     else
         log_error "No supported package manager found (apk)."
         exit 1
+    fi
+
+    if [ "${FORCE_CN:-}" = "1" ]; then
+        configure_package_mirrors
     fi
 
     if ! has_cmd curl; then
@@ -918,8 +1012,10 @@ configure_crowdsec_bouncer() {
 }
 
 enable_alpine_edge_repositories() {
-    local edge_base="https://dl-cdn.alpinelinux.org/alpine/edge"
+    local edge_base=""
     local repo=""
+
+    edge_base="$(get_alpine_repository_base)/edge"
 
     for repo in main community testing; do
         local repo_url="${edge_base}/${repo}"
@@ -1064,6 +1160,7 @@ main() {
     parse_arguments "$@"
 
     detect_os
+    configure_package_mirrors
     apply_cn_proxy_env
     fix_hostname
     report_cn_optimization

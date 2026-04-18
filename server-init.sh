@@ -40,9 +40,14 @@ CN_HTTP_PROXY="${CN_HTTP_PROXY:-}"
 CN_PROXY_PREFIX="${CN_PROXY_PREFIX:-https://ghfast.top/}"
 # Gitee mirror base for GitHub repos when CN.
 CN_GIT_MIRROR_BASE="${CN_GIT_MIRROR_BASE:-https://gitee.com/mirrors}"
+CN_MIRROR_PROVIDER="${CN_MIRROR_PROVIDER:-ustc}"
+CN_APT_MIRROR_BASE="${CN_APT_MIRROR_BASE:-}"
+CN_APT_SECURITY_MIRROR_BASE="${CN_APT_SECURITY_MIRROR_BASE:-}"
+CN_APT_PORTS_MIRROR_BASE="${CN_APT_PORTS_MIRROR_BASE:-}"
 
 IS_CN_MACHINE=""
 FORCE_CN="${FORCE_CN:-}"
+PACKAGE_MIRROR_CONFIGURED="false"
 
 # Colors for output
 RED='\033[0;31m'
@@ -66,6 +71,15 @@ log_error() {
 # Command helpers
 has_cmd() {
     command -v "$1" >/dev/null 2>&1
+}
+
+backup_file_once() {
+    local file="$1"
+    local backup="${file}.bak.personal-server-script"
+
+    if [ -f "$file" ] && [ ! -f "$backup" ]; then
+        cp "$file" "$backup"
+    fi
 }
 
 # Detect whether the machine is in China (best-effort).
@@ -170,6 +184,189 @@ report_cn_optimization() {
     fi
 }
 
+normalize_cn_mirror_provider() {
+    case "$CN_MIRROR_PROVIDER" in
+        ustc|tuna|aliyun)
+            ;;
+        *)
+            log_warn "Unknown CN_MIRROR_PROVIDER '$CN_MIRROR_PROVIDER', falling back to ustc"
+            CN_MIRROR_PROVIDER="ustc"
+            ;;
+    esac
+}
+
+get_apt_mirror_base() {
+    local mirror_kind="${1:-main}"
+
+    normalize_cn_mirror_provider
+
+    case "$mirror_kind" in
+        main)
+            if [ -n "$CN_APT_MIRROR_BASE" ]; then
+                echo "$CN_APT_MIRROR_BASE"
+                return 0
+            fi
+            case "$OS_ID:$CN_MIRROR_PROVIDER" in
+                debian:ustc) echo "https://mirrors.ustc.edu.cn/debian" ;;
+                debian:tuna) echo "https://mirrors.tuna.tsinghua.edu.cn/debian" ;;
+                debian:aliyun) echo "https://mirrors.aliyun.com/debian" ;;
+                ubuntu:ustc) echo "https://mirrors.ustc.edu.cn/ubuntu" ;;
+                ubuntu:tuna) echo "https://mirrors.tuna.tsinghua.edu.cn/ubuntu" ;;
+                ubuntu:aliyun) echo "https://mirrors.aliyun.com/ubuntu" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        security)
+            if [ -n "$CN_APT_SECURITY_MIRROR_BASE" ]; then
+                echo "$CN_APT_SECURITY_MIRROR_BASE"
+                return 0
+            fi
+            if [ "$OS_ID" = "ubuntu" ]; then
+                get_apt_mirror_base main
+                return $?
+            fi
+            case "$CN_MIRROR_PROVIDER" in
+                ustc) echo "https://mirrors.ustc.edu.cn/debian-security" ;;
+                tuna) echo "https://mirrors.tuna.tsinghua.edu.cn/debian-security" ;;
+                aliyun) echo "https://mirrors.aliyun.com/debian-security" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+get_apt_ports_mirror_base() {
+    local base_override=""
+
+    if [ -n "$CN_APT_PORTS_MIRROR_BASE" ]; then
+        echo "$CN_APT_PORTS_MIRROR_BASE"
+        return 0
+    fi
+
+    if [ -n "$CN_APT_MIRROR_BASE" ]; then
+        base_override="${CN_APT_MIRROR_BASE%/}"
+        case "$base_override" in
+            */ubuntu)
+                echo "${base_override%/ubuntu}/ubuntu-ports"
+                return 0
+                ;;
+            *)
+                echo "$base_override"
+                return 0
+                ;;
+        esac
+    fi
+
+    normalize_cn_mirror_provider
+
+    case "$CN_MIRROR_PROVIDER" in
+        ustc) echo "https://mirrors.ustc.edu.cn/ubuntu-ports" ;;
+        tuna) echo "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports" ;;
+        aliyun) echo "https://mirrors.aliyun.com/ubuntu-ports" ;;
+        *) return 1 ;;
+    esac
+}
+
+rewrite_apt_source_file() {
+    local file="$1"
+    local apt_base="$2"
+    local security_base="$3"
+    local ports_base="${4:-$2}"
+    local tmp_file=""
+
+    [ -f "$file" ] || return 1
+
+    tmp_file="$(mktemp)"
+
+    case "$OS_ID" in
+        debian)
+            sed -E \
+                -e "s|https?://deb\.debian\.org/debian|$apt_base|g" \
+                -e "s|https?://cdn-aws\.debian\.org/debian|$apt_base|g" \
+                -e "s|https?://security\.debian\.org/debian-security|$security_base|g" \
+                -e "s|https?://security\.debian\.org/security|$security_base|g" \
+                "$file" > "$tmp_file"
+            ;;
+        ubuntu)
+            sed -E \
+                -e "s|https?://([a-z]{2}\.)?archive\.ubuntu\.com/ubuntu|$apt_base|g" \
+                -e "s|https?://security\.ubuntu\.com/ubuntu|$security_base|g" \
+                -e "s|https?://ports\.ubuntu\.com/ubuntu-ports|$ports_base|g" \
+                "$file" > "$tmp_file"
+            ;;
+        *)
+            rm -f "$tmp_file"
+            return 1
+            ;;
+    esac
+
+    if cmp -s "$file" "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    backup_file_once "$file"
+    mv "$tmp_file" "$file"
+    return 0
+}
+
+configure_package_mirrors() {
+    local apt_base=""
+    local security_base=""
+    local ports_base=""
+    local file=""
+    local changed_count=0
+
+    if [ "$PACKAGE_MIRROR_CONFIGURED" = "true" ]; then
+        return 0
+    fi
+
+    if ! is_cn_machine; then
+        return 0
+    fi
+
+    apt_base="$(get_apt_mirror_base main)" || {
+        log_warn "No APT mirror mapping found for OS '$OS_ID', skipping mirror replacement"
+        PACKAGE_MIRROR_CONFIGURED="true"
+        return 0
+    }
+    security_base="$(get_apt_mirror_base security)" || security_base="$apt_base"
+    ports_base="$apt_base"
+    if [ "$OS_ID" = "ubuntu" ]; then
+        ports_base="$(get_apt_ports_mirror_base)" || ports_base="$apt_base"
+    fi
+
+    log_info "Configuring APT mirrors for CN (provider: $CN_MIRROR_PROVIDER)..."
+
+    if rewrite_apt_source_file "/etc/apt/sources.list" "$apt_base" "$security_base" "$ports_base"; then
+        changed_count=$((changed_count + 1))
+    fi
+
+    for file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [ -e "$file" ] || continue
+        if rewrite_apt_source_file "$file" "$apt_base" "$security_base" "$ports_base"; then
+            changed_count=$((changed_count + 1))
+        fi
+    done
+
+    if [ "$changed_count" -gt 0 ]; then
+        log_info "APT mirror configured: $apt_base"
+        if [ "$security_base" != "$apt_base" ]; then
+            log_info "APT security mirror configured: $security_base"
+        fi
+        if [ "$ports_base" != "$apt_base" ]; then
+            log_info "APT ports mirror configured: $ports_base"
+        fi
+    else
+        log_info "APT sources already use compatible mirrors or no official URLs matched"
+    fi
+
+    PACKAGE_MIRROR_CONFIGURED="true"
+}
+
 prompt_dae_subscription() {
     if [ -n "$DAE_SUBSCRIPTION_URL" ]; then
         return
@@ -249,6 +446,10 @@ detect_os() {
     else
         log_error "No supported package manager found (apt-get/apt)."
         exit 1
+    fi
+
+    if [ "${FORCE_CN:-}" = "1" ]; then
+        configure_package_mirrors
     fi
 
     # Bootstrap essential tools used early in the script.
@@ -1158,6 +1359,7 @@ main() {
     parse_arguments "$@"
 
     detect_os
+    configure_package_mirrors
     apply_cn_proxy_env
     fix_hostname
     report_cn_optimization
