@@ -69,7 +69,7 @@ sudo ./server-init.sh --cn --dae-sub "https://example.com/subscription"
 - `-u, --users`: 通过参数直接传入多个用户
 - `--firewall`: `nftables` 或 `ufw`
 - `--cn`: 强制启用中国网络优化地址
-- `--dae-sub`: dae 配置里的订阅地址
+- `--dae-sub`: 可选，dae 配置里的订阅地址
 - 国内源默认使用 `USTC`，可通过 `CN_MIRROR_PROVIDER=ustc|tuna|aliyun` 切换
 - 也可直接覆盖 `CN_APT_MIRROR_BASE`、`CN_APT_SECURITY_MIRROR_BASE`、`CN_APT_PORTS_MIRROR_BASE`
 
@@ -84,14 +84,18 @@ sudo ./server-init-alpine.sh --cn --dae-sub "https://example.com/subscription"
 
 - 支持 `-a`、`-u`、`--cn`、`--dae-sub`
 - 防火墙默认使用 nftables
+- `--dae-sub` 为可选；未提供时会跳过 dae，但仍继续完整初始化
 - 国内源默认使用 `USTC`，可通过 `CN_MIRROR_PROVIDER=ustc|tuna|aliyun` 或 `CN_APK_MIRROR_BASE` 覆盖
 
 ## 国内镜像说明
 
 - `--cn` 或 `FORCE_CN=1` 时，会优先把系统包管理器官方仓库切到国内镜像，再执行 `apt update` / `apk update`
+- `CN` 模式不会再跳过防火墙、CrowdSec、zsh、mosh、BBR 等初始化步骤；仅 `dae` 订阅仍为可选
+- `CN` 模式下，`oh-my-zsh` 及其常用插件会优先走国内 Git 镜像；包管理器安装则优先走已切换的国内软件源
 - 未强制 `--cn` 时，脚本会在装好 `curl` 后做一次 CN 网络探测；探测到国内环境后，也会在系统更新前切换镜像
 - Debian/Ubuntu 只替换官方仓库 URL，保留现有 suites / components，不重写第三方源
 - Alpine 会同步替换 `/etc/apk/repositories`，并让后续追加的 `edge` 仓库也沿用同一镜像基址
+- 网络相关命令已加入超时/重试控制，可按需通过 `NETWORK_RETRIES`、`NETWORK_MAX_TIME`、`PACKAGE_COMMAND_TIMEOUT`、`INSTALLER_COMMAND_TIMEOUT`、`GIT_CLONE_TIMEOUT` 覆盖默认值
 
 ## `nft-port-forward.sh` 用法
 

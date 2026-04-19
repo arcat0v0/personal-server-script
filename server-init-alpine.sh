@@ -18,7 +18,7 @@
 # - Configure nftables firewall
 # - Install and configure CrowdSec for intrusion prevention
 # - Enable BBR if supported
-# - CN mode: install dae after base tools and skip optional installers
+# - CN mode: use CN mirrors/proxies and still run the full initialization flow
 #############################################
 
 set -e
@@ -37,6 +37,15 @@ CN_APK_MIRROR_BASE="${CN_APK_MIRROR_BASE:-}"
 IS_CN_MACHINE=""
 FORCE_CN="${FORCE_CN:-}"
 PACKAGE_MIRROR_CONFIGURED="false"
+NETWORK_RETRIES="${NETWORK_RETRIES:-3}"
+NETWORK_RETRY_DELAY="${NETWORK_RETRY_DELAY:-2}"
+NETWORK_CONNECT_TIMEOUT="${NETWORK_CONNECT_TIMEOUT:-10}"
+NETWORK_MAX_TIME="${NETWORK_MAX_TIME:-60}"
+PACKAGE_COMMAND_TIMEOUT="${PACKAGE_COMMAND_TIMEOUT:-1800}"
+INSTALLER_COMMAND_TIMEOUT="${INSTALLER_COMMAND_TIMEOUT:-600}"
+GIT_CLONE_TIMEOUT="${GIT_CLONE_TIMEOUT:-180}"
+GIT_LOW_SPEED_LIMIT="${GIT_LOW_SPEED_LIMIT:-1024}"
+GIT_LOW_SPEED_TIME="${GIT_LOW_SPEED_TIME:-30}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -57,6 +66,55 @@ log_error() {
 
 has_cmd() {
     command -v "$1" >/dev/null 2>&1
+}
+
+build_timeout_prefix() {
+    local timeout_seconds="$1"
+
+    if has_cmd timeout && [ -n "$timeout_seconds" ] && [ "$timeout_seconds" -gt 0 ] 2>/dev/null; then
+        printf 'timeout %s ' "$timeout_seconds"
+    fi
+}
+
+run_with_timeout() {
+    local timeout_seconds="$1"
+    shift
+
+    if has_cmd timeout && [ -n "$timeout_seconds" ] && [ "$timeout_seconds" -gt 0 ] 2>/dev/null; then
+        timeout "$timeout_seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
+run_with_retries() {
+    local attempts="$1"
+    shift
+    local attempt=1
+
+    while [ "$attempt" -le "$attempts" ]; do
+        if "$@"; then
+            return 0
+        fi
+
+        if [ "$attempt" -lt "$attempts" ]; then
+            log_warn "Command failed (attempt ${attempt}/${attempts}), retrying in ${NETWORK_RETRY_DELAY}s: $*"
+            sleep "$NETWORK_RETRY_DELAY"
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    return 1
+}
+
+git_clone_as_user() {
+    local username="$1"
+    local repo_url="$2"
+    local dest_path="$3"
+    local clone_cmd=""
+
+    clone_cmd="git -c http.lowSpeedLimit=${GIT_LOW_SPEED_LIMIT} -c http.lowSpeedTime=${GIT_LOW_SPEED_TIME} clone --depth 1 '${repo_url}' '${dest_path}'"
+    run_with_retries "$NETWORK_RETRIES" run_with_timeout "$GIT_CLONE_TIMEOUT" su - "$username" -c "$clone_cmd"
 }
 
 backup_file_once() {
@@ -139,9 +197,9 @@ curl_fetch() {
     fi
 
     if [ -n "$output" ]; then
-        curl -fsSL --connect-timeout 10 --max-time 30 $proxy_arg "$final_url" -o "$output"
+        curl -fsSL --retry "$NETWORK_RETRIES" --retry-delay "$NETWORK_RETRY_DELAY" --connect-timeout "$NETWORK_CONNECT_TIMEOUT" --max-time "$NETWORK_MAX_TIME" $proxy_arg "$final_url" -o "$output"
     else
-        curl -fsSL --connect-timeout 10 --max-time 30 $proxy_arg "$final_url"
+        curl -fsSL --retry "$NETWORK_RETRIES" --retry-delay "$NETWORK_RETRY_DELAY" --connect-timeout "$NETWORK_CONNECT_TIMEOUT" --max-time "$NETWORK_MAX_TIME" $proxy_arg "$final_url"
     fi
 }
 
@@ -257,26 +315,35 @@ prompt_dae_subscription() {
     fi
 
     if ! can_prompt; then
-        log_error "No TTY available. Use --dae-sub URL to provide the subscription URL."
-        return 1
+        log_warn "No TTY available. Use --dae-sub URL to provide the dae subscription URL if needed."
+        return 0
     fi
 
     echo ""
-    log_info "CN mode detected: dae will be installed and configured"
-    printf "%b" "${YELLOW}[PROMPT]${NC} Enter dae subscription URL (my_sub): " > /dev/tty
+    log_info "CN mode detected: dae subscription is optional"
+    printf "%b" "${YELLOW}[PROMPT]${NC} Enter dae subscription URL (my_sub, press Enter to skip): " > /dev/tty
     if ! read -r REPLY < /dev/tty; then
-        return 1
+        return 0
     fi
     if [ -z "$REPLY" ]; then
-        log_error "Subscription URL is required for dae configuration"
-        return 1
+        log_warn "No dae subscription URL provided, skipping dae installation"
+        return 0
     fi
     DAE_SUBSCRIPTION_URL="$REPLY"
 }
 
 install_dae() {
+    local installer_url="https://cdn.jsdelivr.net/gh/daeuniverse/dae-installer/installer.sh"
+    local installer_script="/tmp/dae-installer.sh"
+
     log_info "Installing dae..."
-    sudo sh -c "$(wget -qO- https://cdn.jsdelivr.net/gh/daeuniverse/dae-installer/installer.sh)" @ install use-cdn
+    if ! curl_fetch "$installer_url" "$installer_script"; then
+        log_error "Failed to download dae installer from $installer_url"
+        return 1
+    fi
+
+    chmod +x "$installer_script"
+    run_with_timeout "$INSTALLER_COMMAND_TIMEOUT" sh "$installer_script" @ install use-cdn
     log_info "dae installed"
 }
 
@@ -288,7 +355,7 @@ configure_dae() {
     local template_url=""
 
     template_url="$(proxy_url "$DAE_CONFIG_TEMPLATE_URL")"
-    if ! curl -fsSL "$template_url" -o "$config_src"; then
+    if ! curl_fetch "$template_url" "$config_src"; then
         log_error "Failed to download dae config template from $template_url"
         return 1
     fi
@@ -323,9 +390,14 @@ detect_os() {
         log_warn "Unsupported OS: $OS_ID $OS_VERSION. Will try to continue best-effort."
     fi
 
+    local pkg_timeout_prefix=""
+
+    pkg_timeout_prefix="$(build_timeout_prefix "$PACKAGE_COMMAND_TIMEOUT")"
+
     if has_cmd apk; then
-        PKG_UPDATE="apk update"
-        PKG_INSTALL="apk add"
+        PKG_UPDATE="${pkg_timeout_prefix}apk update"
+        PKG_INSTALL="${pkg_timeout_prefix}apk add"
+        PKG_UPGRADE="${pkg_timeout_prefix}apk upgrade"
     else
         log_error "No supported package manager found (apk)."
         exit 1
@@ -579,8 +651,8 @@ install_common_tools() {
 update_system() {
     log_info "Updating system packages..."
 
-    apk update
-    apk upgrade
+    $PKG_UPDATE
+    $PKG_UPGRADE
 
     install_common_tools
     log_info "System update completed"
@@ -789,13 +861,19 @@ install_zsh() {
     else
         log_info "Installing oh-my-zsh for $username..."
         local omz_install_url="https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh"
+        local omz_remote=""
         if is_cn_machine; then
             omz_install_url="https://gitee.com/mirrors/oh-my-zsh/raw/master/tools/install.sh"
+            omz_remote="${CN_GIT_MIRROR_BASE}/oh-my-zsh.git"
         fi
         local omz_install_script="/tmp/ohmyzsh-install.sh"
         if curl_fetch "$omz_install_url" "$omz_install_script"; then
             chmod +x "$omz_install_script"
-            su - "$username" -c "sh '$omz_install_script' \"\" --unattended"
+            if [ -n "$omz_remote" ]; then
+                run_with_timeout "$INSTALLER_COMMAND_TIMEOUT" su - "$username" -c "REMOTE='$omz_remote' sh '$omz_install_script' \"\" --unattended"
+            else
+                run_with_timeout "$INSTALLER_COMMAND_TIMEOUT" su - "$username" -c "sh '$omz_install_script' \"\" --unattended"
+            fi
         else
             log_error "Failed to download oh-my-zsh installer from $omz_install_url"
         fi
@@ -808,9 +886,9 @@ install_zsh() {
     else
         local autosuggest_repo="https://github.com/zsh-users/zsh-autosuggestions"
         if is_cn_machine; then
-            autosuggest_repo="${CN_GIT_MIRROR_BASE}/zsh-autosuggestions"
+            autosuggest_repo="${CN_GIT_MIRROR_BASE}/zsh-autosuggestions.git"
         fi
-        su - "$username" -c "git clone ${autosuggest_repo} ${user_home}/.oh-my-zsh/custom/plugins/zsh-autosuggestions"
+        git_clone_as_user "$username" "$autosuggest_repo" "${user_home}/.oh-my-zsh/custom/plugins/zsh-autosuggestions"
     fi
 
     if [ -d "${user_home}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting" ]; then
@@ -820,7 +898,7 @@ install_zsh() {
         if is_cn_machine; then
             syntax_repo="${CN_GIT_MIRROR_BASE}/zsh-syntax-highlighting.git"
         fi
-        su - "$username" -c "git clone ${syntax_repo} ${user_home}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting"
+        git_clone_as_user "$username" "$syntax_repo" "${user_home}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting"
     fi
 
     log_info "Configuring zsh plugins..."
@@ -828,11 +906,24 @@ install_zsh() {
 
     log_info "Installing starship prompt..."
     local starship_install_script="/tmp/starship-install.sh"
-    if curl_fetch "https://starship.rs/install.sh" "$starship_install_script"; then
-        sh "$starship_install_script" --yes
-        log_info "Starship installed"
+    if has_cmd starship; then
+        log_warn "starship is already installed, skipping installation"
+    elif $PKG_INSTALL starship; then
+        log_info "Starship installed via package manager"
+    elif curl_fetch "https://starship.rs/install.sh" "$starship_install_script"; then
+        chmod +x "$starship_install_script"
+        if run_with_timeout "$INSTALLER_COMMAND_TIMEOUT" sh "$starship_install_script" --yes; then
+            log_info "Starship installed via official installer"
+        else
+            log_error "Starship installer timed out or failed"
+        fi
     else
         log_error "Failed to download starship installer"
+    fi
+
+    if ! has_cmd starship; then
+        log_error "Starship is unavailable after installation attempts"
+        return 1
     fi
 
     su - "$username" -c "mkdir -p ${user_home}/.config"
@@ -841,9 +932,8 @@ install_zsh() {
     su - "$username" -c "starship preset plain-text-symbols -o ${user_home}/.config/starship.toml"
 
     log_info "Adding starship to .zshrc..."
-    su - "$username" -c "echo '' >> ${user_home}/.zshrc"
-    su - "$username" -c "echo '# Initialize starship prompt' >> ${user_home}/.zshrc"
-    su - "$username" -c "echo 'eval \"\$(starship init zsh)\"' >> ${user_home}/.zshrc"
+    su - "$username" -c "grep -qxF '# Initialize starship prompt' '${user_home}/.zshrc' || printf '\n# Initialize starship prompt\n' >> '${user_home}/.zshrc'"
+    su - "$username" -c "grep -qxF 'eval \"\$(starship init zsh)\"' '${user_home}/.zshrc' || printf '%s\n' 'eval \"\$(starship init zsh)\"' >> '${user_home}/.zshrc'"
 
     log_info "Setting zsh as default shell for $username..."
     chsh -s "$(command -v zsh)" "$username"
@@ -1170,11 +1260,11 @@ main() {
     update_system
 
     if is_cn_machine; then
-        if ! prompt_dae_subscription; then
-            exit 1
+        prompt_dae_subscription
+        if [ -n "$DAE_SUBSCRIPTION_URL" ]; then
+            install_dae
+            configure_dae
         fi
-        install_dae
-        configure_dae
     fi
 
     create_user
@@ -1182,14 +1272,12 @@ main() {
     create_additional_users
     disable_root_login
 
-    if ! is_cn_machine; then
-        install_zsh
-        install_direnv
-        install_mosh
-        configure_nftables
-        install_crowdsec
-        enable_bbr
-    fi
+    install_zsh
+    install_direnv
+    install_mosh
+    configure_nftables
+    install_crowdsec
+    enable_bbr
 
     restart_ssh
 
@@ -1207,28 +1295,29 @@ main() {
     log_info "Hostname resolution has been configured"
     log_info "Root login has been disabled"
     if is_cn_machine; then
-        log_info "dae has been installed and configured"
-        log_info "dae config location: /usr/local/etc/dae/config.dae"
-    else
-        log_info "Zsh with oh-my-zsh has been installed"
-        log_info "Starship prompt has been configured with plain-text-symbols preset"
-        log_info "Direnv has been installed and configured"
-        log_info "Mosh has been installed for better remote connections"
-        log_info "Firewall has been configured and enabled (nftables)"
-        log_info "CrowdSec has been installed for intrusion prevention"
-        log_info "BBR has been checked and enabled if supported"
+        if [ -n "$DAE_SUBSCRIPTION_URL" ]; then
+            log_info "dae has been installed and configured"
+            log_info "dae config location: /usr/local/etc/dae/config.dae"
+        else
+            log_info "dae installation skipped (no subscription URL provided)"
+        fi
     fi
+    log_info "Zsh with oh-my-zsh has been installed"
+    log_info "Starship prompt has been configured with plain-text-symbols preset"
+    log_info "Direnv has been installed and configured"
+    log_info "Mosh has been installed for better remote connections"
+    log_info "Firewall has been configured and enabled (nftables)"
+    log_info "CrowdSec has been installed for intrusion prevention"
+    log_info "BBR has been checked and enabled if supported"
     log_info ""
     log_warn "IMPORTANT: Please test SSH login with user 'arcat' before closing this session!"
     log_info ""
-    if ! is_cn_machine; then
-        log_info "You can also connect using: mosh arcat@your-server-ip"
-        log_info ""
-        log_info "CrowdSec commands:"
-        log_info "  - View alerts: sudo cscli alerts list"
-        log_info "  - View bans: sudo cscli decisions list"
-        log_info "  - View metrics: sudo cscli metrics"
-    fi
+    log_info "You can also connect using: mosh arcat@your-server-ip"
+    log_info ""
+    log_info "CrowdSec commands:"
+    log_info "  - View alerts: sudo cscli alerts list"
+    log_info "  - View bans: sudo cscli decisions list"
+    log_info "  - View metrics: sudo cscli metrics"
     log_info "=========================================="
 }
 
